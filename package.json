@@ -1,0 +1,18 @@
+{
+  "name": "local-rules-release",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local rules configuration release middleware with coordinator, entries and execution services",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "validate": "npm run build && node dist/validate/run.js",
+    "start:coordinator": "node dist/coordinator/main.js",
+    "start:entry": "node dist/entry/main.js",
+    "start:service": "node dist/service/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}

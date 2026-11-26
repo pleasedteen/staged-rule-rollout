@@ -1,0 +1,6 @@
+{
+  "currency": [5, 7, 11, 3],
+  "search": ["apple", "banana", "cherry", "date"],
+  "report": ["q1", "q2", "q3", "q4"],
+  "archive": ["a1", "a2"]
+}

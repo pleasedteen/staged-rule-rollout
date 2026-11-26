@@ -1,0 +1,118 @@
+{
+  "version": "v2",
+  "notes": "String currency pipeline. v2 currency rules expect strings, so a v1 numeric upstream value fails loudly.",
+  "services": {
+    "ingest": {
+      "op": "tag",
+      "operand": "n=",
+      "delayMs": 10
+    },
+    "fx-math": {
+      "op": "concat",
+      "operand": "*2",
+      "delayMs": 10
+    },
+    "fx-tag": {
+      "op": "tag",
+      "operand": "-v2",
+      "delayMs": 500
+    },
+    "fx-final": {
+      "op": "tag",
+      "operand": "-v2",
+      "delayMs": 5
+    },
+    "search-index": {
+      "op": "tag",
+      "operand": "-i2",
+      "delayMs": 5
+    },
+    "search-a": {
+      "op": "concat",
+      "operand": "-a2",
+      "delayMs": 5
+    },
+    "search-b": {
+      "op": "tag",
+      "operand": "-b2",
+      "delayMs": 5
+    },
+    "search-final": {
+      "op": "tag",
+      "operand": "-f2",
+      "delayMs": 5
+    },
+    "report-aggregate": {
+      "op": "concat",
+      "operand": "-agg2",
+      "delayMs": 5
+    },
+    "report-format": {
+      "op": "tag",
+      "operand": "-fmt2",
+      "delayMs": 5
+    },
+    "report-final": {
+      "op": "concat",
+      "operand": "-fin2",
+      "delayMs": 5
+    },
+    "archive-load": {
+      "op": "concat",
+      "operand": "-l2",
+      "delayMs": 5
+    },
+    "archive-store": {
+      "op": "tag",
+      "operand": "-s2",
+      "delayMs": 5
+    }
+  },
+  "routes": {
+    "currency": {
+      "service": "ingest",
+      "branch": [
+        {
+          "service": "fx-math"
+        },
+        {
+          "service": "fx-tag"
+        }
+      ],
+      "join": "list",
+      "next": {
+        "service": "fx-final"
+      }
+    },
+    "search": {
+      "service": "search-index",
+      "branch": [
+        {
+          "service": "search-a"
+        },
+        {
+          "service": "search-b"
+        }
+      ],
+      "join": "concat",
+      "next": {
+        "service": "search-final"
+      }
+    },
+    "report": {
+      "service": "report-aggregate",
+      "next": {
+        "service": "report-format",
+        "next": {
+          "service": "report-final"
+        }
+      }
+    },
+    "archive": {
+      "service": "archive-load",
+      "next": {
+        "service": "archive-store"
+      }
+    }
+  }
+}

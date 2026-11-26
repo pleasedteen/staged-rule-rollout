@@ -1,0 +1,117 @@
+{
+  "version": "v1",
+  "notes": "Numeric currency pipeline; string search/report pipelines. v1 rules reject v2-shaped input.",
+  "services": {
+    "ingest": {
+      "op": "add",
+      "operand": 10,
+      "delayMs": 10
+    },
+    "fx-math": {
+      "op": "double",
+      "delayMs": 10
+    },
+    "fx-tag": {
+      "op": "tag",
+      "operand": "-v1",
+      "delayMs": 500
+    },
+    "fx-final": {
+      "op": "tag",
+      "operand": "-v1",
+      "delayMs": 5
+    },
+    "search-index": {
+      "op": "concat",
+      "operand": "-i1",
+      "delayMs": 5
+    },
+    "search-a": {
+      "op": "concat",
+      "operand": "-a1",
+      "delayMs": 5
+    },
+    "search-b": {
+      "op": "tag",
+      "operand": "-b1",
+      "delayMs": 5
+    },
+    "search-final": {
+      "op": "concat",
+      "operand": "-f1",
+      "delayMs": 5
+    },
+    "report-aggregate": {
+      "op": "tag",
+      "operand": "-agg1",
+      "delayMs": 5
+    },
+    "report-format": {
+      "op": "concat",
+      "operand": "-fmt1",
+      "delayMs": 5
+    },
+    "report-final": {
+      "op": "tag",
+      "operand": "-fin1",
+      "delayMs": 5
+    },
+    "archive-load": {
+      "op": "tag",
+      "operand": "-l1",
+      "delayMs": 5
+    },
+    "archive-store": {
+      "op": "concat",
+      "operand": "-s1",
+      "delayMs": 5
+    }
+  },
+  "routes": {
+    "currency": {
+      "service": "ingest",
+      "branch": [
+        {
+          "service": "fx-math"
+        },
+        {
+          "service": "fx-tag"
+        }
+      ],
+      "join": "list",
+      "next": {
+        "service": "fx-final"
+      }
+    },
+    "search": {
+      "service": "search-index",
+      "branch": [
+        {
+          "service": "search-a"
+        },
+        {
+          "service": "search-b"
+        }
+      ],
+      "join": "concat",
+      "next": {
+        "service": "search-final"
+      }
+    },
+    "report": {
+      "service": "report-aggregate",
+      "next": {
+        "service": "report-format",
+        "next": {
+          "service": "report-final"
+        }
+      }
+    },
+    "archive": {
+      "service": "archive-load",
+      "next": {
+        "service": "archive-store"
+      }
+    }
+  }
+}

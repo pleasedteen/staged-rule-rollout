@@ -1,0 +1,61 @@
+{
+  "description": "Fault fixtures used by `npm run validate` and reproducible by hand (see docs/OPERATIONS.md).",
+  "scenarios": [
+    {
+      "name": "later-batch-service-down",
+      "steps": [
+        "POST /ops/advance            -> batch 1 (currency) effective",
+        "POST /ops/pause",
+        "stop service report-format   (only batch 3 needs it)",
+        "POST /ops/advance            -> 409 paused (no silent advance while paused)",
+        "POST /ops/resume",
+        "POST /ops/advance            -> batch 2 (search) effective despite report-format down",
+        "start service report-format"
+      ]
+    },
+    {
+      "name": "coordinator-crash",
+      "steps": [
+        "kill -9 coordinator",
+        "start coordinator            -> GET /admin/state?detail=1 shows recovered=true",
+        "POST /ops/advance            -> continues from actual batch progress"
+      ]
+    },
+    {
+      "name": "coordinator-crash-mid-switch",
+      "steps": [
+        "POST /ops/advance?fault=committed  -> process exits after entries committed, before bookkeeping",
+        "start coordinator            -> successor re-reads entries, adopts the committed epoch",
+        "GET /admin/state?detail=1    -> batch effective, no duplicate work"
+      ]
+    },
+    {
+      "name": "rollback-with-inflight",
+      "steps": [
+        "POST /accept (currency) x N  -> accepted under current version, long delay",
+        "POST /ops/pause",
+        "POST /ops/rollback",
+        "POST /ops/rollback/confirm   -> succeeds while requests still executing",
+        "GET /requests/:id            -> in-flight requests still return the version pinned at acceptance"
+      ]
+    },
+    {
+      "name": "service-restart-recovery",
+      "steps": [
+        "POST /accept (currency)      -> request enters a delayed segment",
+        "kill -9 <service>",
+        "start <service>              -> boot heals journaled pending units",
+        "GET /requests/:id            -> result matches the version pinned at acceptance"
+      ]
+    },
+    {
+      "name": "entry-crash-cross-entry-retry",
+      "steps": [
+        "POST entry-a /accept         -> accepted and running",
+        "kill -9 entry-a",
+        "POST entry-b /retry {requestId} -> resumes from the shared ledger with the pinned version",
+        "GET entry-b /requests/:id    -> correct result, retries >= 1"
+      ]
+    }
+  ]
+}
