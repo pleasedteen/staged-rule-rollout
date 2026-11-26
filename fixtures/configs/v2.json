@@ -1,6 +1,6 @@
 {
   "version": "v2",
-  "notes": "String currency pipeline. v2 currency rules expect strings, so a v1 numeric upstream value fails loudly.",
+  "notes": "String currency pipeline. v2 currency rules expect strings, so a v1 numeric upstream value fails loudly. The gateway v2 route drops the fx-math/fx-tag fan-out, so batch 4 can switch while those branch services are down.",
   "services": {
     "ingest": {
       "op": "tag",
@@ -112,6 +112,12 @@
       "service": "archive-load",
       "next": {
         "service": "archive-store"
+      }
+    },
+    "gateway": {
+      "service": "ingest",
+      "next": {
+        "service": "fx-final"
       }
     }
   }

@@ -160,13 +160,60 @@ kill -9 $(pgrep -f 'entry/main.js.*--name entry-a')
 curl -s -X POST $EC/retry -H 'content-type: application/json' -d "{\"requestId\":\"$RID\"}" | jq '{ok,version:.record.version,output:.record.output,retries:.record.retries}'
 ```
 
+### 3.7 分支长停机、恢复前切版与回执丢失（gateway 组）
+
+gateway 组复用 currency 的执行服务，但 v2 路由去掉了 fx-math/fx-tag 分支，因此第 4 批
+可以在分支服务停机时切换。前置条件：第 1–3 批已推进（见第 2 节），gateway 仍在 v1、
+第 4 批 pending。入口重试窗口默认 15s，手工复现时建议调短：
+
+```bash
+export RULES_ENTRY_RETRY_WINDOW_MS=2500   # 对入口进程生效后再启动它们
+
+# (a) 停掉 v1 gateway 路由的分支服务 fx-tag，受理一个钉住 v1 的请求
+kill -9 $(pgrep -f 'service/main.js.*--name fx-tag')
+RID=$(curl -s -X POST $EA/accept -H 'content-type: application/json' \
+      -d '{"group":"gateway","input":7}' | jq -r .requestId)
+# 超过重试窗口后请求转入 waiting 等待恢复（而不是失败）；
+# ingest / fx-math 两段已确认落账：
+curl -s $EA/requests/$RID | jq '{status,segments:[.segments[]|{service,version}]}'
+
+# (b) 永久规则错误不参与等待，立即终止并报告：
+curl -s -X POST $EA/submit -H 'content-type: application/json' \
+     -d '{"group":"gateway","input":"not-a-number"}' | jq '{status:.record.status,code:.record.errorCode}'
+
+# (c) 原入口重启：接手进程以同一请求身份自动续跑（仍 waiting）
+kill -9 $(pgrep -f 'entry/main.js.*--name entry-a')
+node dist/entry/main.js --data-dir $DATA --topology $TOP --name entry-a &
+curl -s $EA/requests/$RID | jq '{status,retries,resumedBy}'
+
+# (d) 恢复前切换组绑定：第 4 批的 v2 路由不需要 fx-tag，推进成功
+curl -s -X POST $C/ops/advance | jq '{ok,batchIndex}'
+curl -s -X POST $EC/submit -H 'content-type: application/json' \
+     -d '{"group":"gateway","input":9}' | jq '{version:.record.version,output:.record.output}'
+
+# (e) 停掉“已确认分支”的服务 fx-math，再恢复 fx-tag：
+#     汇合直接使用已确认的 fx-math 结果，不再调用 fx-math
+kill -9 $(pgrep -f 'service/main.js.*--name fx-math')
+node dist/service/main.js --data-dir $DATA --topology $TOP --name fx-tag &
+curl -s $EA/requests/$RID | jq '{status,output,segments:[.segments[]|{service,version,instance}]}'
+
+# (f) 回执丢失：fx-final 落盘后故意丢一张回执，入口重试命中日志而不重算
+curl -s -X POST http://127.0.0.1:7413/admin/fault -H 'content-type: application/json' -d '{"loseReceipts":1}'
+RID2=$(curl -s -X POST $EC/accept -H 'content-type: application/json' \
+       -d '{"group":"gateway","input":21}' | jq -r .requestId)
+curl -s $EC/requests/$RID2 | jq '{status,output}'
+curl -s http://127.0.0.1:7413/admin/journal | jq '.computes.byKey'   # 该请求键的实算次数 == 1
+```
+
 ---
 
 ## 4. 观察与排错
 
 - 批次与绑定：`GET /admin/state`、`GET /admin/state?detail=1`
 - 请求各段版本与结果：`GET <entry>/requests/:id`
+  （状态机：`accepted → running → done/failed`；分支服务长停机时为 `waiting`，恢复后自动续跑）
 - 入口/服务实时能力：`GET /admin/entries`、`GET /admin/services`
+- 服务实算去重：`GET <service>/admin/journal` 的 `computes.byKey`（每键实算次数）
 - 配置传输计量：`GET /admin/transport`
 - 日志：每个进程打印到 stdout，带时间戳与角色前缀（如 `[entry-a]`）。
 

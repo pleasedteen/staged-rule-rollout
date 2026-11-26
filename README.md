@@ -13,13 +13,13 @@
 
 ```bash
 npm install          # 安装 typescript / @types/node（仅开发依赖）
-npm run validate     # 构建 + 启动真实多进程集群 + 跑全部 72 项断言，约 20s
+npm run validate     # 构建 + 启动真实多进程集群 + 跑全部 92 项断言，约 30s
 ```
 
 `npm run validate` 结束时打印类似：
 
 ```
-ALL CHECKS PASSED (72/72), Elapsed: 19.7s (limit 80s)
+ALL CHECKS PASSED (92/92), Elapsed: 30.3s (limit 80s)
 ```
 
 同时把结构化结果写入 `.run/validation-report.json`。
@@ -42,6 +42,10 @@ node dist/service/main.js     --data-dir .run --topology fixtures/topology.json 
   （`node:sqlite`，`journal_mode=DELETE` 且关闭 mmap；单写者，安全）。
 
 `RULES_STORE=file` 可让本地库也退回 JSON 文件；`RULES_STORE=sqlite` 在缺少 `node:sqlite` 时报错。
+
+入口调段的故障等待可用环境变量调整：`RULES_ENTRY_RETRY_WINDOW_MS`（重试窗口，默认 15000，
+超时后请求转 `waiting` 继续等待）与 `RULES_ENTRY_WAIT_TIMEOUT_MS`（等待上限，默认 600000，
+超时才判失败）。
 
 ---
 
@@ -129,6 +133,21 @@ fixture 中 v1 是数值管线、v2 是字符串管线，彼此的规则类型�
 - 对 v1 的 `double` 段输入字符串 → `422 wrong_input_type`；
 - 对不存在的版本执行 → `409 version_not_installed`。
 
+### 3.7 长停机等待、段级确认与回执去重
+
+- **分支服务停机超过入口重试窗口**：已受理请求转入 `waiting` 继续等待恢复（默认窗口
+  15s，可用 `RULES_ENTRY_RETRY_WINDOW_MS` 调整），而不是失败；服务恢复后自动续跑。
+  永久规则错误（`wrong_input_type` / `bad_rule`）不参与等待，仍立即终止并报告。
+- **段级确认**：每个执行段完成的瞬间就写入共享账本。入口重启或跨入口恢复时，已确认
+  的段按原样复用、不再调用对应服务——因此汇合（join）可以使用已确认完成的另一分支
+  结果，即使该分支的服务此时已停机。
+- **入口重启自动续跑**：入口启动时扫描共享账本，以同一请求身份自动恢复自己未完成的
+  请求（`accepted` / `running` / `waiting`），版本仍从账本读回。
+- **回执迟到 / 丢失**：执行服务对同一日志键（`requestId|slot|version`）单飞实算——
+  重复 `/execute` 等待在途计算或直接命中日志，同一进程对同一段只实算一次，所有调用方
+  拿到一致结果。`/admin/journal` 暴露每键实算次数；`POST /admin/fault
+  {loseReceipts:N}` 是测试专用钩子，在日志落盘后故意丢弃接下来 N 张执行回执。
+
 ---
 
 ## 4. 崩溃与重启恢复
@@ -157,8 +176,9 @@ fixture 中 v1 是数值管线、v2 是字符串管线，彼此的规则类型�
 
 ### 4.4 入口崩溃
 
-请求受理时版本已写入共享账本。任一入口 `/retry { requestId }` 都能从账本恢复并跑完，
-沿用钉住版本（章节 11）。
+请求受理时版本已写入共享账本，每个完成的执行段也即时落账。入口重启后自动扫描账本、
+以同一请求身份续跑自己未完成的请求（章节 14）；任一入口也可用 `/retry { requestId }`
+从账本恢复并跑完，沿用钉住版本（章节 11）。
 
 ---
 
@@ -213,10 +233,11 @@ fixture 中 v1 是数值管线、v2 是字符串管线，彼此的规则类型�
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/execute {requestId, version, slot, service, input}` | 执行一个段 |
+| POST | `/execute {requestId, version, slot, service, input}` | 执行一个段（同一日志键单飞实算） |
 | GET  | `/admin/versions` | 已安装版本 + 日志统计 |
 | POST | `/admin/config {doc, digest}` | 安装配置（校验 digest） |
-| GET  | `/admin/journal` | 写前日志统计 |
+| GET  | `/admin/journal` | 写前日志统计 + 每键实算次数（`computes`） |
+| POST | `/admin/fault {loseReceipts}` | 测试专用：落盘后丢弃接下来 N 张执行回执 |
 | GET  | `/admin/transport` | 本服务配置传输计量 |
 
 ---
@@ -225,14 +246,16 @@ fixture 中 v1 是数值管线、v2 是字符串管线，彼此的规则类型�
 
 | 文件 | 内容 |
 |------|------|
-| `topology.json` | 1 协调器 + 3 入口 + 13 执行服务；3 个组 currency/search/report/archive |
-| `plan.json` | 3 批：currency；{search, report} 同批；archive |
-| `configs/v1.json`、`configs/v2.json` | 两个版本；v1 数值、v2 字符串（互不兼容，混用即错） |
+| `topology.json` | 1 协调器 + 3 入口 + 13 执行服务；5 个组 currency/search/report/archive/gateway |
+| `plan.json` | 4 批：currency；{search, report} 同批；archive；gateway |
+| `configs/v1.json`、`configs/v2.json` | 两个版本；v1 数值、v2 字符串（互不兼容，混用即错）；gateway 的 v1 路由带分支、v2 路由去掉分支服务 |
 | `requests.json` | 各组示例请求 |
 | `faults.json` | 故障场景复现步骤 |
 
 组与批次：`batch-2-content` 用两个组（search+report）验证**同批共享边界**；
 archive 服务仅被第 3 批需要，用于验证**后续批专属服务停机不影响当前批**。
+gateway 复用 currency 的执行服务，但 v2 路由不再经过 fx-math/fx-tag 分支——因此第 4 批
+可以在分支服务停机时切换绑定，用于验证**长停机等待、恢复前切版与回执去重**（章节 14）。
 
 ---
 
@@ -266,7 +289,7 @@ kill -9 <entry-pid>                # 入口崩溃；在另一入口 POST /retry 
 
 ---
 
-## 9. 验证覆盖（`npm run validate`，72 项断言）
+## 9. 验证覆盖（`npm run validate`，92 项断言）
 
 1. 启动 & 初始状态（全 v1）
 2. 首次受理钉住版本；段版本一致（含并行分支）；结果匹配独立 oracle
@@ -281,7 +304,11 @@ kill -9 <entry-pid>                # 入口崩溃；在另一入口 POST /retry 
 11. 入口崩溃后跨入口 `/retry`：沿用钉住版本并得到正确结果
 12. 请求量 24 → 全量配置传输字节 `delta == 0`；每请求仍执行完整路由
 13. 版本混用被显式拒绝（类型错误 / 版本未安装）
-14. 终态一致：全部批次生效；旧版本在发布完成后仍可执行
+14. **带分支的长停机场景**（gateway 组）：分支服务停机超过入口重试窗口 → 已受理请求 `waiting`
+    等待恢复；永久规则错误立即终止并报告；原入口重启后以同一请求身份自动续跑；恢复前切换组
+    绑定 → 旧请求仍用钉住的 v1、新请求用 v2；阻塞服务恢复而**已确认分支的服务停机**时，用已确认
+    结果汇合完成；回执丢失 / 并发重复执行 → 同一进程对同一段只实算一次、结果一致
+15. 终态一致：全部批次生效；旧版本在发布完成后仍可执行
 
 ---
 

@@ -1,15 +1,15 @@
 {
   "coordinator": { "port": 7400 },
   "entries": [
-    { "name": "entry-a", "port": 7401, "groups": ["currency", "search", "archive"] },
+    { "name": "entry-a", "port": 7401, "groups": ["currency", "search", "archive", "gateway"] },
     { "name": "entry-b", "port": 7402, "groups": ["search", "report"] },
-    { "name": "entry-c", "port": 7403, "groups": ["currency", "report", "archive"] }
+    { "name": "entry-c", "port": 7403, "groups": ["currency", "report", "archive", "gateway"] }
   ],
   "services": [
-    { "name": "ingest",           "port": 7410, "groups": ["currency"] },
-    { "name": "fx-math",          "port": 7411, "groups": ["currency"] },
-    { "name": "fx-tag",           "port": 7412, "groups": ["currency"] },
-    { "name": "fx-final",         "port": 7413, "groups": ["currency"] },
+    { "name": "ingest",           "port": 7410, "groups": ["currency", "gateway"] },
+    { "name": "fx-math",          "port": 7411, "groups": ["currency", "gateway"] },
+    { "name": "fx-tag",           "port": 7412, "groups": ["currency", "gateway"] },
+    { "name": "fx-final",         "port": 7413, "groups": ["currency", "gateway"] },
     { "name": "search-index",     "port": 7414, "groups": ["search"] },
     { "name": "search-a",         "port": 7415, "groups": ["search"] },
     { "name": "search-b",         "port": 7416, "groups": ["search"] },

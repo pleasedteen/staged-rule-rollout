@@ -53,6 +53,17 @@ class ExecutionService {
     requestBytes: 0,
     requests: 0,
   };
+  /**
+   * Single-flight: one in-flight computation per journal key in this process.
+   * A duplicate /execute (late or lost receipt → client retry) awaits the
+   * running unit instead of recomputing it, so one process computes a segment
+   * at most once and every waiter gets the same result.
+   */
+  private readonly inflightUnits = new Map<string, Promise<JournalEntry>>();
+  /** Per-key real computations performed by this process (observability). */
+  private readonly computes = new Map<string, number>();
+  /** Test-only fault: drop this many execute receipts after journaling. */
+  private lostReceipts = 0;
   private instance = '';
   private bootNo = 0;
   private inflight = 0;
@@ -123,6 +134,7 @@ class ExecutionService {
 
   /** Pure, deterministic application of one rule; also used during boot heal. */
   private compute(entry: JournalEntry, doc: ConfigDocument): JournalEntry {
+    this.computes.set(entry.key, (this.computes.get(entry.key) ?? 0) + 1);
     const rule = doc.services[this.name];
     if (!rule) {
       return {
@@ -149,13 +161,42 @@ class ExecutionService {
     }
   }
 
+  /** Delay + compute + journal for one unit; shared by every waiter on its key. */
+  private async runUnit(pending: JournalEntry, doc: ConfigDocument): Promise<JournalEntry> {
+    const rule = doc.services[this.name];
+    const delayMs = rule?.delayMs ?? 0;
+    if (delayMs > 0) await sleep(delayMs);
+    const done = this.compute(pending, doc);
+    this.journal.put({ ...done, updatedAt: Date.now() });
+    return done;
+  }
+
+  /** Shape one journal entry into an /execute response. */
+  private respond(
+    done: JournalEntry,
+    extra: Record<string, unknown>,
+  ): { status: number; body: Record<string, unknown> } {
+    const response: ExecuteResponse = {
+      ok: !done.error,
+      service: this.name,
+      instance: this.instance,
+      version: done.version,
+      output: done.output,
+      ms: 0,
+      recovered: Boolean(done.healed) || done.bootInstance !== this.instance,
+      error: done.error,
+      code: done.errorCode,
+    };
+    return { status: done.error ? 422 : 200, body: { ...response, ...extra } };
+  }
+
   private async handle(ctx: {
     method: string;
     path: string;
     query: URLSearchParams;
     body: any;
     bytes: number;
-  }): Promise<{ status?: number; body?: unknown }> {
+  }): Promise<{ status?: number; body?: unknown; dropConnection?: boolean }> {
     const { path, method } = ctx;
 
     if (path === '/health' && method === 'GET') {
@@ -217,8 +258,26 @@ class ExecutionService {
           total: all.length,
           pending: all.filter((entry) => entry.state === 'pending').length,
           healed: all.filter((entry) => entry.healed).length,
+          computes: {
+            total: [...this.computes.values()].reduce((sum, n) => sum + n, 0),
+            byKey: Object.fromEntries(this.computes),
+          },
         },
       };
+    }
+
+    /**
+     * Test-only fault injection, mirroring the coordinator's `fault` options.
+     * `loseReceipts: N` drops the HTTP receipt of the next N executed units
+     * *after* they are journaled, so the caller's retry must hit the dedup
+     * path rather than recompute.
+     */
+    if (path === '/admin/fault' && method === 'POST') {
+      const lose = Number(ctx.body?.loseReceipts ?? 0);
+      if (Number.isFinite(lose) && lose > 0) {
+        this.lostReceipts += Math.floor(lose);
+      }
+      return { status: 200, body: { ok: true, lostReceipts: this.lostReceipts } };
     }
 
     if (path === '/admin/transport' && method === 'GET') {
@@ -251,7 +310,7 @@ class ExecutionService {
   private async execute(ctx: {
     body: any;
     bytes: number;
-  }): Promise<{ status?: number; body?: unknown }> {
+  }): Promise<{ status?: number; body?: unknown; dropConnection?: boolean }> {
     const requestId = ctx.body?.requestId as string | undefined;
     const version = ctx.body?.version as Version | undefined;
     const slot = (ctx.body?.slot as string | undefined) ?? 'root';
@@ -289,22 +348,15 @@ class ExecutionService {
     const key = `${requestId}|${slot}|${version}`;
     const existing = this.journal.get(key);
     if (existing && existing.state === 'done') {
-      const recovered = Boolean(existing.healed) || existing.bootInstance !== this.instance;
-      const response: ExecuteResponse = {
-        ok: !existing.error,
-        service: this.name,
-        instance: this.instance,
-        version: existing.version,
-        output: existing.output,
-        ms: 0,
-        recovered,
-        error: existing.error,
-        code: existing.errorCode,
-      };
-      return {
-        status: existing.error ? 422 : 200,
-        body: { ...response, cached: true },
-      };
+      return this.respond(existing, { cached: true });
+    }
+
+    // A retry for a unit this process is already computing waits for that same
+    // computation instead of starting a second one (receipt late/lost).
+    const running = this.inflightUnits.get(key);
+    if (running) {
+      const done = await running;
+      return this.respond(done, { deduped: true });
     }
 
     const startedAt = Date.now();
@@ -324,27 +376,34 @@ class ExecutionService {
     };
     this.journal.put(pending);
 
-    const rule = doc.services[this.name];
-    const delayMs = rule?.delayMs ?? 0;
+    const unit = this.runUnit(pending, doc);
+    this.inflightUnits.set(key, unit);
+    let done: JournalEntry;
     try {
-      if (delayMs > 0) await sleep(delayMs);
-      const done = this.compute(pending, doc);
-      this.journal.put({ ...done, updatedAt: Date.now() });
-      const response: ExecuteResponse = {
-        ok: !done.error,
-        service: this.name,
-        instance: this.instance,
-        version,
-        output: done.output,
-        ms: Date.now() - startedAt,
-        recovered: false,
-        error: done.error,
-        code: done.errorCode,
-      };
-      return { status: done.error ? 422 : 200, body: response };
+      done = await unit;
     } finally {
+      this.inflightUnits.delete(key);
       this.inflight -= 1;
     }
+
+    if (this.lostReceipts > 0) {
+      this.lostReceipts -= 1;
+      logEvent(this.name, 'dropping execute receipt (fault)', { key });
+      return { dropConnection: true };
+    }
+
+    const response: ExecuteResponse = {
+      ok: !done.error,
+      service: this.name,
+      instance: this.instance,
+      version,
+      output: done.output,
+      ms: Date.now() - startedAt,
+      recovered: false,
+      error: done.error,
+      code: done.errorCode,
+    };
+    return { status: done.error ? 422 : 200, body: response };
   }
 
   async close(): Promise<void> {

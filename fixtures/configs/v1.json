@@ -112,6 +112,21 @@
       "next": {
         "service": "archive-store"
       }
+    },
+    "gateway": {
+      "service": "ingest",
+      "branch": [
+        {
+          "service": "fx-math"
+        },
+        {
+          "service": "fx-tag"
+        }
+      ],
+      "join": "list",
+      "next": {
+        "service": "fx-final"
+      }
     }
   }
 }

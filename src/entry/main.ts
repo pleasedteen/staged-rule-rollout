@@ -51,6 +51,16 @@ interface TransportTotals {
 }
 
 /**
+ * How long one segment call keeps retrying a transient failure before the
+ * request parks (`waiting`) instead of failing. Parked requests keep retrying
+ * until the service recovers (bounded by WAIT_TIMEOUT_MS) because an accepted
+ * request must outlive a branch-service outage that exceeds the retry window.
+ */
+const RETRY_WINDOW_MS = Number(process.env.RULES_ENTRY_RETRY_WINDOW_MS ?? 15000);
+const WAIT_TIMEOUT_MS = Number(process.env.RULES_ENTRY_WAIT_TIMEOUT_MS ?? 600000);
+const PARK_RETRY_MS = 400;
+
+/**
  * Local entry (gateway).
  *
  * Responsibilities:
@@ -164,6 +174,44 @@ class EntryGateway {
       groups: def.groups,
       versions: this.binding.versions,
     });
+    // Requests this entry accepted but never finished (crash while running or
+    // parked on a down service) resume automatically under the same request
+    // identity; the pinned version comes from the ledger, never re-read.
+    this.recoverAccepted();
+  }
+
+  /**
+   * Auto-resume this entry's unfinished requests after a restart. Only records
+   * owned by this entry name are taken; cross-entry take-over stays an
+   * explicit operator action (`/retry`) so two entries never race one request.
+   */
+  private recoverAccepted(): void {
+    const unfinished = this.ledger
+      .records()
+      .filter(
+        (record) =>
+          record.entry === this.name &&
+          (record.status === 'accepted' ||
+            record.status === 'running' ||
+            record.status === 'waiting'),
+      );
+    for (const record of unfinished) {
+      logEvent(this.name, 'auto-resuming accepted request after restart', {
+        requestId: record.requestId,
+        status: record.status,
+        version: record.version,
+      });
+      const task: Promise<void> = this.resume(record.requestId)
+        .then(() => undefined)
+        .catch((err: unknown) => {
+          logEvent(this.name, 'auto-resume failed', {
+            requestId: record.requestId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      this.active.add(task);
+      void task.finally(() => this.active.delete(task));
+    }
   }
 
   /** Durably remember committed bindings so acceptance survives restarts. */
@@ -223,16 +271,20 @@ class EntryGateway {
   /**
    * Execute a route node: run its service, recurse into branch children in
    * parallel and join, then feed the joined value into `next`.
+   *
+   * Every segment is persisted to the shared ledger the moment it completes
+   * ("confirmed"). Slots already present in `confirmed` — computed before an
+   * entry restart or a cross-entry resume — are reused as-is and their
+   * services are never called again, so a join can complete from a confirmed
+   * branch result even while that branch's service is down.
    */
   private async runStep(
     step: RouteStep,
     input: unknown,
     record: RequestRecord,
+    confirmed: Map<string, SegmentResult>,
   ): Promise<unknown> {
-    const segments: SegmentResult[] = [];
-    const output = await this.runStepInto(step, input, record, [], segments);
-    record.segments.push(...segments);
-    return output;
+    return this.runStepInto(step, input, record, [], confirmed);
   }
 
   private async runStepInto(
@@ -240,42 +292,44 @@ class EntryGateway {
     input: unknown,
     record: RequestRecord,
     path: ServiceName[],
-    segments: SegmentResult[],
+    confirmed: Map<string, SegmentResult>,
   ): Promise<unknown> {
     const slot = [...path, step.service].join('>');
-    const segment = await this.callService(step.service, slot, input, record);
-    segments.push(segment);
-
-    let value: unknown = segment.output;
+    let value: unknown;
+    const prior = confirmed.get(slot);
+    if (prior) {
+      value = prior.output;
+    } else {
+      const segment = await this.callService(step.service, slot, input, record);
+      record.segments.push(segment);
+      // Durability before proceeding: this segment is now confirmed and any
+      // future resume (here or on another entry) will reuse it verbatim.
+      this.ledger.saveRecord(record);
+      value = segment.output;
+    }
 
     if (step.branch && step.branch.length > 0) {
-      const branchResults = await Promise.all(
-        step.branch.map(async (child, index) => {
-          const childSegments: SegmentResult[] = [];
-          const result = await this.runStepInto(
-            child,
-            value,
-            record,
-            [...path, `${step.service}[b${index}]`],
-            childSegments,
-          );
-          return { segments: childSegments, value: result };
-        }),
+      const branchValues = await Promise.all(
+        step.branch.map((child, index) =>
+          this.runStepInto(child, value, record, [...path, `${step.service}[b${index}]`], confirmed),
+        ),
       );
-      for (const branch of branchResults) segments.push(...branch.segments);
-      value = joinValues(step.join, branchResults.map((branch) => branch.value));
+      value = joinValues(step.join, branchValues);
     }
 
     if (step.next) {
-      value = await this.runStepInto(step.next, value, record, path, segments);
+      value = await this.runStepInto(step.next, value, record, path, confirmed);
     }
     return value;
   }
 
   /**
    * Call one service with retry. Transport failures and version-not-installed
-   * errors are retried (a restarting service needs a moment); rule type errors
-   * are permanent and bubble up.
+   * errors are retried inside a bounded window; when the window expires the
+   * request *parks* (`waiting`, persisted) and keeps retrying slowly until the
+   * service recovers — an accepted request waits out a long branch-service
+   * outage rather than failing. Rule type errors are permanent and bubble up
+   * immediately, so a permanent rule error still terminates the request.
    *
    * The retry carries the *same* pinned version and the same slot key, so the
    * service's journal resumes rather than recomputing from scratch.
@@ -289,9 +343,10 @@ class EntryGateway {
     const url = serviceUrl(this.topology, service);
     const startedAt = Date.now();
     let recovered = false;
+    let parked = false;
     let lastError: { error: string; code?: string; installed?: Version[] } | undefined;
 
-    for (let attempt = 0; attempt < 40; attempt += 1) {
+    for (let attempt = 0; ; attempt += 1) {
       const res = await jsonRequest<{
         ok: boolean;
         output?: unknown;
@@ -314,6 +369,16 @@ class EntryGateway {
       });
 
       if (res.ok && res.body?.ok) {
+        if (parked) {
+          // The blocking service recovered; the request is running again.
+          record.status = 'running';
+          this.ledger.saveRecord(record);
+          logEvent(this.name, 'request resumed after service recovery', {
+            requestId: record.requestId,
+            service,
+            slot,
+          });
+        }
         this.transport.requests += 1;
         this.transport.requestBytes += res.bytesOut;
         return {
@@ -345,10 +410,30 @@ class EntryGateway {
         }
       }
       if (lastError.code === 'wrong_input_type' || lastError.code === 'bad_rule') {
+        // Permanent rule error: terminate and report, never park.
         break;
       }
       recovered = true;
-      await sleep(Math.min(40 + attempt * 20, 400));
+      const elapsed = Date.now() - startedAt;
+      if (elapsed > RETRY_WINDOW_MS + WAIT_TIMEOUT_MS) {
+        break;
+      }
+      if (elapsed > RETRY_WINDOW_MS) {
+        if (!parked) {
+          parked = true;
+          record.status = 'waiting';
+          this.ledger.saveRecord(record);
+          logEvent(this.name, 'request parked: waiting for service recovery', {
+            requestId: record.requestId,
+            service,
+            slot,
+            retryWindowMs: RETRY_WINDOW_MS,
+          });
+        }
+        await sleep(PARK_RETRY_MS);
+      } else {
+        await sleep(Math.min(40 + attempt * 20, 400));
+      }
     }
 
     throw new RuleError(
@@ -398,6 +483,16 @@ class EntryGateway {
         group: record.group,
       });
     }
+    // Segments confirmed by a previous run of this same pinned request are
+    // reused; everything else executes. Confirmed slots are deduped by slot
+    // key, and only entries matching the pinned version are trusted.
+    const confirmed = new Map<string, SegmentResult>();
+    for (const segment of record.segments) {
+      if (segment.version === record.version && !confirmed.has(segment.slot)) {
+        confirmed.set(segment.slot, segment);
+      }
+    }
+    record.segments = [...confirmed.values()];
     record.status = 'running';
     record.startedAt = Date.now();
     record.path = routePath(doc, record.group);
@@ -405,7 +500,7 @@ class EntryGateway {
     this.running.set(record.requestId, record);
 
     try {
-      const output = await this.runStep(route, record.input, record);
+      const output = await this.runStep(route, record.input, record, confirmed);
       record.output = output;
       record.status = 'done';
       record.finishedAt = Date.now();
@@ -595,10 +690,10 @@ class EntryGateway {
     record.group = entry.group;
     if (record.input === undefined) record.input = entry.input;
 
-    // Reset for a clean re-run: segments are journaled inside the services, so
-    // completed units are returned from cache without redoing work.
+    // Keep the confirmed segments: they are reused verbatim by execute(), so
+    // already-finished branch results survive both an entry restart and the
+    // (possibly still-down) state of the services that produced them.
     record.status = 'accepted';
-    record.segments = [];
     record.output = undefined;
     record.error = undefined;
     record.errorCode = undefined;

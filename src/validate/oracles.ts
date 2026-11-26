@@ -100,3 +100,34 @@ export function expectedArchiveV2(input: string): string {
   const load = `${input}-l2`; // concat "-l2"
   return `${load}-s2`; // tag "-s2"
 }
+
+/* -------------------------------- gateway ---------------------------------- */
+/*
+ * The gateway group reuses the currency services but versions its route:
+ *   v1: ingest → branch[fx-math, fx-tag] join list → fx-final   (branched)
+ *   v2: ingest → fx-final                                       (no fan-out)
+ * Because the v2 route never references fx-math/fx-tag, batch 4 may switch
+ * while those branch services are down; parked v1 requests keep their pin.
+ */
+
+export function expectedGatewayV1(input: number): string {
+  const ingest = input + 10; // add 10
+  const branchMath = ingest * 2; // fx-math: double
+  const branchTag = `${ingest}-v1`; // fx-tag: tag "-v1"
+  const joined = [branchMath, branchTag]; // join: list
+  return `${listToString(joined)}-v1`; // fx-final: tag "-v1"
+}
+
+export function gatewayV1Segments(input: number): {
+  ingest: number;
+  branchMath: number;
+  branchTag: string;
+} {
+  const ingest = input + 10;
+  return { ingest, branchMath: ingest * 2, branchTag: `${ingest}-v1` };
+}
+
+export function expectedGatewayV2(input: number): string {
+  const ingest = `${input}n=`; // tag "n="
+  return `${ingest}-v2`; // fx-final: tag "-v2"
+}

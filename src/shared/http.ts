@@ -105,12 +105,20 @@ export interface HandlerContext {
   bytes: number;
 }
 
+export interface HandlerResult {
+  status?: number;
+  body?: unknown;
+  /**
+   * Test-only fault hook: close the socket without responding, simulating a
+   * lost execution receipt. The work is already journaled, so the client's
+   * retry exercises the dedup path.
+   */
+  dropConnection?: boolean;
+}
+
 export type Handler = (
   ctx: HandlerContext,
-) =>
-  | Promise<{ status?: number; body?: unknown } | void>
-  | { status?: number; body?: unknown }
-  | void;
+) => Promise<HandlerResult | void> | HandlerResult | void;
 
 export interface JsonServer {
   url: string;
@@ -146,6 +154,12 @@ export async function startJsonServer(port: number, handler: Handler): Promise<J
             body,
             bytes,
           })) ?? {};
+        if (result.dropConnection) {
+          // Deliberately lose the receipt: destroy the socket mid-conversation
+          // so the caller sees a transport error and retries.
+          req.socket.destroy();
+          return;
+        }
         const status = result.status ?? 200;
         const payload = result.body === undefined ? '' : JSON.stringify(result.body);
         res.writeHead(status, {

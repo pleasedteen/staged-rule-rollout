@@ -177,7 +177,12 @@ export interface SegmentResult {
   recovered: boolean;
 }
 
-export type RequestStatus = 'accepted' | 'running' | 'done' | 'failed';
+/**
+ * `waiting`: the request outlasted the entry's retry window on a transient
+ * segment failure (e.g. its branch service is down) and is parked, still
+ * retrying, until the service recovers. Terminal states remain done/failed.
+ */
+export type RequestStatus = 'accepted' | 'running' | 'waiting' | 'done' | 'failed';
 
 export interface RequestRecord {
   requestId: string;

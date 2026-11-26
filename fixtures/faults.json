@@ -56,6 +56,28 @@
         "POST entry-b /retry {requestId} -> resumes from the shared ledger with the pinned version",
         "GET entry-b /requests/:id    -> correct result, retries >= 1"
       ]
+    },
+    {
+      "name": "long-branch-outage-pre-recovery-switch",
+      "steps": [
+        "stop service fx-tag          (a v1 gateway branch service)",
+        "POST entry-a /accept {group:gateway} -> pinned v1; fx-math/ingest confirm, fx-tag unreachable",
+        "GET entry-a /requests/:id    -> status=waiting after the retry window (no failure)",
+        "POST entry-a /submit {group:gateway, input:'x'} -> fails fast with wrong_input_type (permanent errors never park)",
+        "kill -9 entry-a; start entry-a -> auto-resumes the same requestId, still waiting",
+        "POST /ops/advance            -> batch 4 effective: gateway=v2 (v2 route needs no fx-*)",
+        "POST entry-c /submit {group:gateway} -> new traffic pins v2",
+        "stop service fx-math; start service fx-tag",
+        "GET entry-a /requests/:id    -> done on pinned v1; join reused the confirmed fx-math result"
+      ]
+    },
+    {
+      "name": "lost-execute-receipt",
+      "steps": [
+        "POST fx-final /admin/fault {loseReceipts:1}",
+        "POST entry-c /submit {group:gateway} -> entry retry hits the journaled unit",
+        "GET fx-final /admin/journal  -> computes.byKey[<requestId>|fx-final|v2] == 1 (computed once)"
+      ]
     }
   ]
 }

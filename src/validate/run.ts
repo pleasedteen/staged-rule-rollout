@@ -9,9 +9,12 @@ import {
   expectedArchiveV2,
   expectedCurrencyV1,
   expectedCurrencyV2,
+  expectedGatewayV1,
+  expectedGatewayV2,
   expectedReportV2,
   expectedSearchV1,
   expectedSearchV2,
+  gatewayV1Segments,
 } from './oracles';
 
 const ROOT = resolve(__dirname, '..', '..');
@@ -58,7 +61,14 @@ class Cluster {
     const proc: ProcessSpec = { ...spec, exited: false, stdout: [], stderr: [] };
     const child = spawn(process.execPath, spec.args, {
       cwd: ROOT,
-      env: { ...process.env, NODE_NO_WARNINGS: '1' },
+      env: {
+        ...process.env,
+        NODE_NO_WARNINGS: '1',
+        // Shorten the entry retry window so the long-outage scenario reaches
+        // the parked ("waiting") state quickly; parked requests keep waiting
+        // for recovery regardless, so other sections are unaffected.
+        RULES_ENTRY_RETRY_WINDOW_MS: '2500',
+      },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -249,10 +259,18 @@ interface RecordView {
   group: string;
   status: string;
   output?: unknown;
-  segments: { service: string; version: string; recovered: boolean; slot: string; output: unknown }[];
+  segments: {
+    service: string;
+    instance?: string;
+    version: string;
+    recovered: boolean;
+    slot: string;
+    output: unknown;
+  }[];
   retries: number;
   resumedBy?: string;
   error?: string;
+  errorCode?: string;
 }
 
 const state = async (detail = false): Promise<StateView> => {
@@ -306,6 +324,23 @@ const waitRecord = async (
     last = await getRecord(entry, requestId);
     if (last && (last.status === 'done' || last.status === 'failed')) return last;
     await sleep(40);
+  }
+  return last;
+};
+
+/** Poll a request record until it satisfies a predicate (e.g. `waiting`). */
+const waitForRecord = async (
+  entry: string,
+  requestId: string,
+  pred: (record: RecordView) => boolean,
+  timeoutMs = 20000,
+): Promise<RecordView | undefined> => {
+  const deadline = Date.now() + timeoutMs;
+  let last: RecordView | undefined;
+  while (Date.now() < deadline) {
+    last = await getRecord(entry, requestId);
+    if (last && pred(last)) return last;
+    await sleep(60);
   }
   return last;
 };
@@ -401,7 +436,7 @@ async function main(): Promise<number> {
       initial.batches.map((batch) => `${batch.name}=${batch.status}`).join(', '),
     );
     report.check(
-      Object.values(initial.bindings.versions).length === 4 &&
+      Object.values(initial.bindings.versions).length === 5 &&
         Object.values(initial.bindings.versions).every((version) => version === 'v1'),
       'initial bindings are v1 for every group',
       JSON.stringify(initial.bindings.versions),
@@ -615,8 +650,9 @@ async function main(): Promise<number> {
         `recoveries=${recovered.recoveries} note=${recovered.lastRecovery}`,
       );
       report.check(
-        recovered.batches.every((batch) => batch.status === 'effective'),
-        'successor sees all batches effective',
+        recovered.batches.slice(0, 3).every((batch) => batch.status === 'effective') &&
+          recovered.batches[3].status === 'pending',
+        'successor sees batches 1-3 effective (batch 4 still pending)',
         recovered.batches.map((b) => `${b.name}=${b.status}`).join(', '),
       );
       report.check(
@@ -908,8 +944,205 @@ async function main(): Promise<number> {
       );
     }
 
-    /* -------------------------- 14. final sanity -------------------------- */
-    report.section('14. Final consistency');
+    /* ---- 14. long branch outage, pre-recovery switch, lost receipts ------ */
+    report.section('14. Long branch outage, pre-recovery switch & lost receipts (gateway)');
+    {
+      // The gateway group reuses the currency services but versions its route:
+      // v1 fans out to fx-math/fx-tag, v2 does not — so batch 4 can switch
+      // while those branch services are down. fx-tag stays down far longer
+      // than the (test-shortened) entry retry window.
+      const pre = await state();
+      report.check(
+        pre.bindings.versions.gateway === 'v1' && pre.batches[3].status === 'pending',
+        'precondition: gateway on v1 with batch 4 pending',
+        `gateway=${pre.bindings.versions.gateway} batch4=${pre.batches[3].status}`,
+      );
+
+      // (a) Accept under v1 with fx-tag down: fx-math confirms, fx-tag cannot.
+      await cluster.kill('fx-tag');
+      const parked = await accept('entry-a', 'gateway', 7);
+      report.check(
+        parked.status === 200 && parked.body.version === 'v1',
+        'gateway request accepted under v1 with fx-tag down',
+        `v=${parked.body?.version} id=${parked.body?.requestId ?? 'n/a'}`,
+      );
+      const parkedId = parked.body.requestId as string;
+      const waiting = await waitForRecord('entry-a', parkedId, (record) => record.status === 'waiting', 15000);
+      report.check(
+        waiting?.status === 'waiting',
+        'accepted request outlives the retry window and waits for recovery',
+        `status=${waiting?.status} (retry window 2500ms, fx-tag stays down)`,
+      );
+      const confirmed = (waiting?.segments ?? [])
+        .map((segment) => `${segment.service}@${segment.version}`)
+        .sort()
+        .join(' | ');
+      report.check(
+        (waiting?.segments ?? []).length === 2 && confirmed === 'fx-math@v1 | ingest@v1',
+        'finished branch segments are confirmed (durable) while fx-tag is down',
+        confirmed || 'none',
+      );
+
+      // (b) A permanent rule error still terminates and reports, promptly,
+      // even though a branch service is down and another request is parked.
+      const badStarted = Date.now();
+      const bad = await submit('entry-a', 'gateway', 'not-a-number');
+      const badMs = Date.now() - badStarted;
+      const badRecord = bad.body.record as RecordView | undefined;
+      report.check(
+        badRecord?.status === 'failed' && badRecord.errorCode === 'wrong_input_type',
+        'permanent rule error terminates and reports (no parking)',
+        `status=${badRecord?.status} code=${badRecord?.errorCode} in ${badMs}ms`,
+      );
+      report.check(
+        badMs < 2500,
+        'the permanent error did not wait out the retry window',
+        `failed in ${badMs}ms (window 2500ms)`,
+      );
+
+      // (c) The original entry restarts while the request is parked and the
+      // blocking service is still down: the same request identity auto-resumes.
+      await cluster.kill('entry-a');
+      await cluster.restart('entry-a');
+      const resumed = await waitForRecord(
+        'entry-a',
+        parkedId,
+        (record) => record.retries >= 1 && record.status === 'waiting',
+        15000,
+      );
+      report.check(
+        Boolean(resumed) && (resumed?.resumedBy ?? '').startsWith('entry-a#'),
+        'restarted entry auto-resumes the same request identity and keeps waiting',
+        `retries=${resumed?.retries} resumedBy=${resumed?.resumedBy} status=${resumed?.status}`,
+      );
+
+      // (d) Switch the group binding BEFORE the blocking service recovers.
+      const advance = await ops('/ops/advance');
+      report.check(
+        advance.status === 200 && advance.body.ok,
+        'batch 4 switches gateway to v2 while fx-tag is still down',
+        advance.body.error ?? JSON.stringify(advance.body.blocked ?? 'ok'),
+      );
+      report.check(
+        (await state()).bindings.versions.gateway === 'v2',
+        'gateway binding is v2 after the pre-recovery switch',
+        JSON.stringify((await state()).bindings.versions),
+      );
+      const fresh = await submit('entry-c', 'gateway', 9);
+      const freshRecord = fresh.body.record as RecordView | undefined;
+      report.check(
+        freshRecord?.version === 'v2' && recordsEqual(freshRecord.output, expectedGatewayV2(9)),
+        'new gateway traffic pins the switched v2',
+        `v=${freshRecord?.version} out=${JSON.stringify(freshRecord?.output)} exp=${JSON.stringify(expectedGatewayV2(9))}`,
+      );
+      report.check(
+        (freshRecord?.segments ?? []).length === 2 &&
+          (freshRecord?.segments ?? []).every((segment) => segment.version === 'v2'),
+        'the v2 route ran exactly its two segments, all on v2',
+        (freshRecord?.segments ?? []).map((segment) => `${segment.service}@${segment.version}`).join(' | '),
+      );
+
+      // (e) Recover the blocking service while the *confirmed* branch's
+      // service (fx-math) is down: the join must reuse the confirmed fx-math
+      // result without calling fx-math again.
+      await cluster.kill('fx-math');
+      await cluster.restart('fx-tag');
+      const done = await waitForRecord(
+        'entry-a',
+        parkedId,
+        (record) => record.status === 'done' || record.status === 'failed',
+        20000,
+      );
+      report.check(
+        done?.status === 'done' && recordsEqual(done.output, expectedGatewayV1(7)),
+        'parked request completes on its pinned v1 once fx-tag recovers',
+        `status=${done?.status} out=${JSON.stringify(done?.output)} exp=${JSON.stringify(expectedGatewayV1(7))}`,
+      );
+      report.check(
+        (done?.segments ?? []).length === 4 &&
+          (done?.segments ?? []).every((segment) => segment.version === 'v1'),
+        'every segment of the long-parked request is the pinned v1',
+        (done?.segments ?? []).map((segment) => `${segment.service}@${segment.version}`).join(' | '),
+      );
+      const mathSegment = (done?.segments ?? []).find((segment) => segment.service === 'fx-math');
+      report.check(
+        mathSegment?.instance === 'fx-math#1' && recordsEqual(mathSegment.output, gatewayV1Segments(7).branchMath),
+        'join reused the confirmed fx-math result while fx-math was down',
+        `instance=${mathSegment?.instance} output=${JSON.stringify(mathSegment?.output)}`,
+      );
+
+      // (f) Lost receipt: fx-final computes and journals the unit but the
+      // receipt never reaches the entry; the retry must not recompute.
+      await jsonRequest(serviceBase('fx-final'), {
+        path: '/admin/fault',
+        body: { loseReceipts: 1 },
+        timeoutMs: 3000,
+      });
+      const lost = await submit('entry-c', 'gateway', 21);
+      const lostRecord = lost.body.record as RecordView | undefined;
+      const lostId = (lost.body.receipt as { requestId?: string } | undefined)?.requestId ?? '';
+      report.check(
+        lostRecord?.status === 'done' && recordsEqual(lostRecord.output, expectedGatewayV2(21)),
+        'request completes correctly despite the lost receipt',
+        `status=${lostRecord?.status} out=${JSON.stringify(lostRecord?.output)}`,
+      );
+      const lostFinal = (lostRecord?.segments ?? []).find((segment) => segment.service === 'fx-final');
+      report.check(
+        lostFinal?.recovered === true,
+        'the lost receipt triggered an entry-side retry',
+        `recovered=${lostFinal?.recovered}`,
+      );
+      const finalJournal = await jsonRequest<{ computes: { byKey: Record<string, number> } }>(
+        serviceBase('fx-final'),
+        { path: '/admin/journal', timeoutMs: 3000 },
+      );
+      const lostKey = `${lostId}|${lostFinal?.slot ?? 'fx-final'}|v2`;
+      report.check(
+        finalJournal.body?.computes.byKey[lostKey] === 1,
+        'fx-final computed the retried segment exactly once',
+        `key=${lostKey} computes=${finalJournal.body?.computes.byKey[lostKey] ?? 'n/a'}`,
+      );
+
+      // (g) Late-receipt overlap: identical /execute calls race one in-flight
+      // unit; the service computes once and every caller gets the same result.
+      const dupBody = { requestId: 'dup-receipt-1', version: 'v2', slot: 'probe', service: 'fx-tag', input: 'late' };
+      const dups = await Promise.all(
+        [0, 1, 2].map(() =>
+          jsonRequest<{ ok: boolean; output?: unknown }>(serviceBase('fx-tag'), {
+            path: '/execute',
+            body: dupBody,
+            timeoutMs: 5000,
+          }),
+        ),
+      );
+      const dupOutputs = dups.map((dup) => JSON.stringify(dup.body?.output));
+      report.check(
+        dups.every((dup) => dup.ok) && new Set(dupOutputs).size === 1,
+        'concurrent duplicate executes return one consistent result',
+        dupOutputs.join(' '),
+      );
+      const tagJournal = await jsonRequest<{ computes: { byKey: Record<string, number> } }>(
+        serviceBase('fx-tag'),
+        { path: '/admin/journal', timeoutMs: 3000 },
+      );
+      report.check(
+        tagJournal.body?.computes.byKey['dup-receipt-1|probe|v2'] === 1,
+        'the service computed the duplicated segment exactly once',
+        `computes=${tagJournal.body?.computes.byKey['dup-receipt-1|probe|v2'] ?? 'n/a'}`,
+      );
+
+      // (h) Restore everything; batch 4 must be effective for the final checks.
+      await cluster.restart('fx-math');
+      const after = await state();
+      report.check(
+        after.batches[3].status === 'effective' && after.bindings.versions.gateway === 'v2',
+        'batch 4 effective with gateway on v2 after the scenario',
+        `batch4=${after.batches[3].status} gateway=${after.bindings.versions.gateway}`,
+      );
+    }
+
+    /* -------------------------- 15. final sanity -------------------------- */
+    report.section('15. Final consistency');
     {
       const final = await state(true);
       report.check(
