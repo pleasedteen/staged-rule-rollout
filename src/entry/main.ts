@@ -20,6 +20,7 @@ import {
   LedgerRepository,
   LocalConfigCache,
   ProcessState,
+  BindingAckRepository,
   type KvStore,
 } from '../shared/store';
 import { ConfigCache } from '../shared/configCache';
@@ -41,6 +42,8 @@ interface BindingState {
   versions: Record<GroupId, Version>;
   digests: Record<Version, string>;
   pendingEpoch: number | null;
+  /** Wall-clock timestamp of the last commit (for boundary-timing checks). */
+  committedAt?: number;
 }
 
 interface TransportTotals {
@@ -68,6 +71,7 @@ interface TransportTotals {
 class EntryGateway {
   private readonly cache: ConfigCache;
   private readonly ledger: LedgerRepository;
+  private readonly ackRepo: BindingAckRepository;
   private readonly peers = new PeerClient();
   private readonly binding: BindingState = {
     epoch: 0,
@@ -81,6 +85,12 @@ class EntryGateway {
     versions: Record<GroupId, Version>;
     digests: Record<Version, string>;
   } | null = null;
+  /**
+   * Validation-only hook: delay each prepare so the two-phase boundary can be
+   * observed (no entry may expose the new epoch while another is still
+   * preparing). Driven by RULES_PREPARE_DELAY_MS.
+   */
+  private readonly prepareDelayMs = Number(process.env.RULES_PREPARE_DELAY_MS ?? 0) || 0;
   private readonly transport: TransportTotals = {
     configBytes: 0,
     configFetches: 0,
@@ -109,6 +119,7 @@ class EntryGateway {
       role: `entry:${name}`,
     });
     this.ledger = new LedgerRepository(cluster);
+    this.ackRepo = new BindingAckRepository(cluster);
   }
 
   static async start(
@@ -139,11 +150,16 @@ class EntryGateway {
       this.binding.epoch = saved.epoch;
       this.binding.versions = { ...saved.versions };
       this.binding.digests = { ...saved.digests };
+      this.binding.committedAt = saved.committedAt;
       for (const [version, digest] of Object.entries(this.binding.digests)) {
         this.cache.setExpectedDigest(version, digest);
       }
       this.initialized = true;
     }
+    // The shared cluster store is authoritative even when the coordinator
+    // process is gone: a rollback confirmed during a coordinator outage must
+    // be observed by an entry that restarts in that window.
+    this.pullClusterBindings();
     await this.pullBindings();
     // Pre-warm every version any of our groups may be pinned to. Combined with
     // the durable local cache this is what lets the entry keep accepting if the
@@ -173,6 +189,7 @@ class EntryGateway {
       versions: this.binding.versions,
       digests: this.binding.digests,
       pendingEpoch: null,
+      committedAt: this.binding.committedAt,
     } satisfies BindingState);
   }
 
@@ -190,34 +207,76 @@ class EntryGateway {
     }
   }
 
-  /** Fetch bindings from the coordinator; keep-local on failure. */
+  /**
+   * Adopt a newer binding map. Returns true when applied. Only strictly newer
+   * epochs are accepted, so a stale read can never rewind the pin map.
+   */
+  private applyFetchedBindings(next: BindingsView, source: 'http' | 'cluster'): boolean {
+    if (typeof next.epoch !== 'number') return false;
+    const shouldApply =
+      !this.initialized || next.epoch > this.binding.epoch;
+    if (!shouldApply) return false;
+    this.binding.epoch = next.epoch;
+    this.binding.versions = { ...next.versions };
+    this.binding.digests = { ...(next.digests ?? {}) };
+    for (const [version, digest] of Object.entries(this.binding.digests)) {
+      this.cache.setExpectedDigest(version, digest);
+    }
+    this.initialized = true;
+    this.binding.committedAt = next.updatedAt || Date.now();
+    this.persistBindings();
+    // Make sure any newly required version is locally available even while the
+    // coordinator stays unreachable (the cluster store also holds the docs).
+    for (const version of new Set(Object.values(this.binding.versions))) {
+      void this.cache.warm(version, 1500).catch(() => false);
+    }
+    logEvent(this.name, `bindings adopted from ${source}`, { epoch: next.epoch });
+    return true;
+  }
+
+  /**
+   * Read the authoritative bindings directly from the shared cluster store.
+   * Works without the coordinator process — this is the recovery path for an
+   * entry restarting during a coordinator outage (e.g. after a rollback).
+   */
+  private pullClusterBindings(): boolean {
+    try {
+      const next = this.cluster.get<BindingsView>('coordinator:bindings');
+      if (!next) return false;
+      return this.applyFetchedBindings(next, 'cluster');
+    } catch {
+      return false;
+    }
+  }
+
+  /** Fetch bindings from the coordinator; fall back to the cluster store. */
   private async pullBindings(): Promise<void> {
     const res = await jsonRequest<BindingsView>(coordinatorUrl(this.topology), {
       path: '/admin/bindings',
       timeoutMs: 800,
     });
-    if (!res.ok || !res.body) return;
-    const next = res.body;
-    // Advance, or initialize for the very first time. A stale read (older
-    // epoch) must never rewind the pin map.
-    const shouldApply =
-      !this.initialized || (typeof next.epoch === 'number' && next.epoch > this.binding.epoch);
-    if (shouldApply && typeof next.epoch === 'number') {
-      this.binding.epoch = next.epoch;
-      this.binding.versions = { ...next.versions };
-      this.binding.digests = { ...(next.digests ?? {}) };
-      for (const [version, digest] of Object.entries(this.binding.digests)) {
-        this.cache.setExpectedDigest(version, digest);
-      }
-      this.initialized = true;
-      this.persistBindings();
+    if (res.ok && res.body) {
+      this.applyFetchedBindings(res.body, 'http');
+      return;
     }
+    // Coordinator unreachable: the shared store still reflects every durable
+    // cut-over (including rollbacks confirmed while we were offline).
+    this.pullClusterBindings();
   }
 
   /* --------------------------------- routes -------------------------------- */
 
   private async doc(version: Version): Promise<ConfigDocument> {
     return this.cache.get(version, 2500);
+  }
+
+  private currentBindingsView(): BindingsView {
+    return {
+      epoch: this.binding.epoch,
+      versions: { ...this.binding.versions },
+      digests: { ...this.binding.digests },
+      updatedAt: this.binding.committedAt ?? Date.now(),
+    };
   }
 
   /**
@@ -641,6 +700,7 @@ class EntryGateway {
           versions: this.binding.versions,
           digests: this.binding.digests,
           pendingEpoch: this.binding.pendingEpoch,
+          committedAt: this.binding.committedAt ?? null,
           ...(detail
             ? {
                 cachedVersions: this.cache.versions(),
@@ -669,6 +729,11 @@ class EntryGateway {
           },
         };
       }
+      // A re-prepare of the epoch we already committed is idempotent and
+      // immediately acknowledged (successor re-convergence).
+      if (epoch === this.binding.epoch) {
+        return { status: 200, body: { ok: true, epoch, instance: this.instance, alreadyCommitted: true } };
+      }
       // Prepare ensures every version this entry may need is locally available,
       // so commit can be a pure in-memory flip even if the coordinator dies.
       for (const version of new Set(Object.values(versions))) {
@@ -681,9 +746,21 @@ class EntryGateway {
           };
         }
       }
+      // Test hook: make the prepare phase observable. The entry keeps serving
+      // the previously committed map throughout the delay.
+      if (this.prepareDelayMs > 0) await sleep(this.prepareDelayMs);
       this.binding.pendingEpoch = epoch;
       this.staged = { epoch, versions: { ...versions }, digests: { ...(digests ?? {}) } };
       return { status: 200, body: { ok: true, epoch, instance: this.instance } };
+    }
+
+    if (path === '/admin/abort' && method === 'POST') {
+      const epoch = ctx.body?.epoch as number | undefined;
+      if (this.staged && (epoch === undefined || this.staged.epoch === epoch)) {
+        this.staged = null;
+        this.binding.pendingEpoch = null;
+      }
+      return { status: 200, body: { ok: true, epoch: this.binding.epoch, instance: this.instance } };
     }
 
     if (path === '/admin/commit' && method === 'POST') {
@@ -697,35 +774,40 @@ class EntryGateway {
           body: { ok: false, error: `stale epoch ${epoch} < current ${this.binding.epoch}` },
         };
       }
-      if (this.staged && this.staged.epoch === epoch) {
-        // Normal path: flip exactly the prepared map. Pure in-memory, so it
-        // cannot fail for I/O reasons between prepare and commit.
-        this.binding.versions = { ...this.staged.versions };
-        if (Object.keys(this.staged.digests).length > 0) {
-          this.binding.digests = { ...this.staged.digests };
-          for (const [version, digest] of Object.entries(this.staged.digests)) {
-            this.cache.setExpectedDigest(version, digest);
-          }
-        }
-        this.staged = null;
-      } else {
-        // Commit without a local prepare (e.g. coordinator recovered and is
-        // re-asserting existing bindings): adopt the authoritative map.
-        const bindings = await jsonRequest<BindingsView>(coordinatorUrl(this.topology), {
-          path: '/admin/bindings',
-          timeoutMs: 800,
-        });
-        if (bindings.ok && bindings.body) {
-          this.binding.versions = { ...bindings.body.versions };
-          this.binding.digests = { ...(bindings.body.digests ?? {}) };
-        } else {
-          return { status: 409, body: { ok: false, error: 'no staged bindings and coordinator unreachable' } };
+      // Idempotent re-commit of the epoch we already run (successor pushing
+      // the settled map): re-acknowledge durably and report success.
+      if (epoch === this.binding.epoch) {
+        this.ackRepo.acknowledge(epoch, this.name, this.currentBindingsView());
+        return { status: 200, body: { ok: true, epoch: this.binding.epoch, alreadyCommitted: true } };
+      }
+      if (!this.staged || this.staged.epoch !== epoch) {
+        // No matching prepare: a late commit must never flip this entry. The
+        // coordinator re-asserts settled bindings through prepare/commit.
+        return {
+          status: 409,
+          body: { ok: false, code: 'not_prepared', error: `epoch ${epoch} is not staged on this entry` },
+        };
+      }
+      // Normal path: flip exactly the prepared map. Pure in-memory, so it
+      // cannot fail for I/O reasons between prepare and commit.
+      const staged = this.staged;
+      this.binding.versions = { ...staged.versions };
+      if (Object.keys(staged.digests).length > 0) {
+        this.binding.digests = { ...staged.digests };
+        for (const [version, digest] of Object.entries(staged.digests)) {
+          this.cache.setExpectedDigest(version, digest);
         }
       }
       this.binding.epoch = epoch;
       this.binding.pendingEpoch = null;
+      this.binding.committedAt = Date.now();
+      this.staged = null;
       this.persistBindings();
-      return { status: 200, body: { ok: true, epoch: this.binding.epoch } };
+      // Durable acknowledgement in the *shared* store BEFORE replying: a
+      // coordinator successor can settle the switch even if this entry is
+      // later unreachable.
+      this.ackRepo.acknowledge(epoch, this.name, this.currentBindingsView());
+      return { status: 200, body: { ok: true, epoch: this.binding.epoch, committedAt: this.binding.committedAt } };
     }
 
     if (path === '/accept' && method === 'POST') {

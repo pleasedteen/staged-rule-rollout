@@ -19,7 +19,7 @@ npm run validate     # 构建 + 启动真实多进程集群 + 跑全部 72 项�
 `npm run validate` 结束时打印类似：
 
 ```
-ALL CHECKS PASSED (72/72), Elapsed: 19.7s (limit 80s)
+ALL CHECKS PASSED (106/106), Elapsed: 28.9s (limit 80s)
 ```
 
 同时把结构化结果写入 `.run/validation-report.json`。
@@ -76,7 +76,7 @@ node dist/service/main.js     --data-dir .run --topology fixtures/topology.json 
 
 | 存储 | 路径 | 引擎 | 内容 |
 |------|------|------|------|
-| 集群库 | `<data-dir>/cluster.state.json` | 锁文件 + 原子 rename | 发布计划/批次状态、当前绑定、配置文档、请求受理账本与请求记录 |
+| 集群库 | `<data-dir>/cluster.state.json` | 锁文件 + 原子 rename | 发布计划/批次状态、当前绑定、**入口绑定提交确认（`binding-ack:<epoch>`）**、配置文档、请求受理账本与请求记录 |
 | 本地库 | `<data-dir>/local/<进程名>.sqlite` | SQLite（单写者） | 配置缓存、执行服务写前日志、入口已提交绑定、boot 计数、传输计量 |
 
 > 集群库被协调器与全部入口并发读写，因此在容器 / 网络 / FUSE 文件系统上使用可移植的锁文件引擎；
@@ -102,8 +102,11 @@ node dist/service/main.js     --data-dir .run --topology fixtures/topology.json 
 ### 3.2 分批发布与共享生效边界
 
 计划由若干批次组成，每批覆盖若干流量组，`targetVersion` 为 v2。**同一批的所有组在同一
-个 `epoch` 边界一起切换**（协调器先 `prepare` 全部入口，再 `commit` 同一 epoch）。
-批次严格按顺序推进。
+个 `epoch` 边界一起切换**。切换是严格两阶段：协调器先向**每个可达入口**下发 `prepare`
+（只暂存绑定、预热配置，不翻转任何入口），全部 prepare 成功后才在一个并行扇出里发出
+`commit`——因此不存在“某入口已切、另一入口还在旧版本”的中间态；同批各组入口的新请求
+共用同一个生效边界（各入口 `committedAt` 落在同一毫秒窗口内）。任一入口 prepare 失败，
+整批切换中止，并通知所有已暂存的入口 `abort` 该 epoch。批次严格按顺序推进。
 
 ### 3.3 批次就绪只取决于本批所需服务
 
@@ -112,15 +115,20 @@ node dist/service/main.js     --data-dir .run --topology fixtures/topology.json 
 
 ### 3.4 暂停 / 显式继续
 
-`/ops/pause` 后，`/ops/advance` 返回 `409 paused`；已生效批次保持原状。必须
-`/ops/resume` 后才能继续切换。
+`/ops/pause` 后，`/ops/advance` 返回 `409 paused`；已生效批次保持原状，**未生效批次保留
+原版本绑定**。若暂停正好落在 prepare 扇出与 commit 之间，边界守卫会中止本次切换（已暂存
+的 prepare 被 `abort`），迟到的 prepare / commit / 就绪结果都不会触发翻转。必须
+`/ops/resume` 显式继续后，下一次推进才能切换。
 
 ### 3.5 回退（可在请求仍在执行时确认）
 
 - `/ops/rollback { batchIndex }` 记录回退意图（`requested`）。
-- `/ops/rollback/confirm` 在暂停期间、且有请求仍在执行时也可确认。
+- `/ops/rollback/confirm` 在暂停期间、且有请求仍在执行时也可确认；即使有入口离线也能确认
+  （切换只扇出到可达入口，掉队入口随后追平）。
 - 确认后，**新受理**的请求使用该组发布前（`before`）的版本；**已在执行**的请求继续用其
-  钉住的版本跑完，结果正确。
+  钉住的版本跑完，后续每一段执行与结果都沿用首次受理版本，结果正确。
+- 离线入口即使在协调器停机期间才恢复，也会直接从**共享集群库**读到回退后的权威绑定
+  （不依赖协调器 HTTP），其首条新请求即使用回退版本。
 
 ### 3.6 混用版本会报错
 
@@ -136,17 +144,24 @@ fixture 中 v1 是数值管线、v2 是字符串管线，彼此的规则类型�
 ### 4.1 协调器崩溃
 
 - 每次切换前，协调器先把 `pending`（完整目标绑定映射）**持久化**，再触碰入口。
-- 入口以 prepare→commit 落盘；协调器 fan-out 后回读所有入口的 epoch，全部一致才标记批次
-  `effective`。
-- 协调器被 `kill -9` 后，接手进程（`main.ts` 启动即 `recover()`）：
-  1. 若存在 `pending`：询问各入口实际 epoch，全部达到 → **采纳**该切换；否则丢弃未落地的意图；
-  2. 任何 `switching` 批次按入口实际状态校正；
-  3. 重新向入口下发当前绑定，使掉队入口追平。
-- 查询 `GET /admin/state?detail=1` 可看到各批**实际生效版本**、发布状态、各入口 epoch。
+- 入口以 prepare→commit 落盘；入口在 commit 应答前，先把该 epoch 的绑定**确认（ack）写入
+  共享集群库**（`binding-ack:<epoch>`）。协调器 fan-out 后回读所有入口的 epoch，全部一致才
+  标记批次 `effective`，并把已确认入口记录在 `pending.committedEntries`。
+- 协调器被 `kill -9` 后，接手进程（`main.ts` 启动即 `recover()`）依据**持久证据**而非猜测
+  对账：
+  1. 若存在 `pending`：先查共享库的 ack 与各入口实际 epoch——全部确认/达到 → **采纳**该
+     切换；有确凿证据表明无一落地 → 丢弃未落地意图；**暂时无法证明（如所有入口都探测不到）
+     → 保留 `pending`（`retained`），下次恢复再判，绝不误丢**；
+  2. 任何 `switching` 批次按入口实际状态（或持久 ack）校正；
+  3. 重新向可达入口下发当前绑定，使掉队入口追平。
+- 因此即使接手者暂时探测不到任何入口，也能仅凭集群库查准批次状态并继续推进。查询
+  `GET /admin/state?detail=1` 可看到各批**实际生效版本**、发布状态、各入口 epoch。
 
 ### 4.2 协调器停机期间
 
-入口按本地已提交的绑定继续受理（后台每 200 ms 尝试拉取绑定，失败则保持本地），请求正常完成。
+入口按本地已提交的绑定继续受理（后台每 200 ms 尝试拉取绑定，HTTP 失败则直接读**共享集群库
+里的权威绑定**作为回退，再失败则保持本地），请求正常完成。这样回退等切换即使发生在协调器
+停机窗口，重启后的入口首条新请求也能用到正确版本。
 
 ### 4.3 执行服务重启
 
@@ -205,8 +220,9 @@ fixture 中 v1 是数值管线、v2 是字符串管线，彼此的规则类型�
 | GET  | `/requests/:id` | 查询请求记录（各段实际版本 + 最终结果） |
 | POST | `/retry {requestId}` | 从账本恢复执行（可跨入口） |
 | GET  | `/status` | 入口状态（epoch、组、版本、in-flight） |
-| GET  | `/admin/bindings?detail=1` | 实际绑定 + 缓存版本 + in-flight |
+| GET  | `/admin/bindings?detail=1` | 实际绑定 + 缓存版本 + in-flight（含 `committedAt`） |
 | POST | `/admin/prepare` / `/admin/commit` | 两阶段绑定切换（协调器调用） |
+| POST | `/admin/abort {epoch}` | 丢弃已 prepare 但未 commit 的暂存 epoch（切换中止） |
 | GET  | `/admin/inflight` | 正在执行的请求数 |
 
 ### 执行服务（:7410–:7422）
@@ -266,7 +282,7 @@ kill -9 <entry-pid>                # 入口崩溃；在另一入口 POST /retry 
 
 ---
 
-## 9. 验证覆盖（`npm run validate`，72 项断言）
+## 9. 验证覆盖（`npm run validate`，106 项断言）
 
 1. 启动 & 初始状态（全 v1）
 2. 首次受理钉住版本；段版本一致（含并行分支）；结果匹配独立 oracle
@@ -282,6 +298,10 @@ kill -9 <entry-pid>                # 入口崩溃；在另一入口 POST /retry 
 12. 请求量 24 → 全量配置传输字节 `delta == 0`；每请求仍执行完整路由
 13. 版本混用被显式拒绝（类型错误 / 版本未安装）
 14. 终态一致：全部批次生效；旧版本在发布完成后仍可执行
+15. **严格两阶段共享边界**：prepare 全部完成前没有任何入口翻转；各入口在同一毫秒窗口 commit
+16. **切换中暂停**：边界守卫中止切换，未生效批次保留原版本，迟到的 prepare/commit 不触发翻转，显式 resume 后才推进
+17. **所有入口不可探测时的崩溃恢复**：未落地意图被保留（不误丢）；已提交切换凭共享库持久 ack 在零探测下被采纳，入口回归后收敛
+18. **离线入口 + 协调器停机下确认回退**：在途请求沿用首次受理版本；各组新请求用发布前版本；离线入口协调器停机时恢复，首条新请求也用回退版本（经集群库读到权威绑定）
 
 ---
 

@@ -69,7 +69,10 @@ curl -s -X POST $C/ops/advance | jq .
 curl -s -X POST $C/ops/advance | jq .
 ```
 
-每次推进都会更新 `bindings.epoch`；同批所有组共享该 epoch。
+每次推进都会更新 `bindings.epoch`；同批所有组共享该 epoch。切换为严格两阶段：协调器先让
+**所有可达入口** prepare（暂存 + 预热，不翻转），全部成功后才并行 commit，因此不存在入口
+先后切版本的中间态。若在 prepare 扇出期间暂停，切换会被中止，已暂存的 epoch 通过入口的
+`POST /admin/abort {epoch}` 丢弃，迟到的 prepare/commit 不会触发任何翻转。
 
 ---
 
@@ -99,6 +102,11 @@ curl -s -X POST $EB/submit -H 'content-type: application/json' \
 node dist/coordinator/main.js --data-dir $DATA --topology $TOP --plan fixtures/plan.json &
 curl -s "$C/admin/state?detail=1" | jq '{recovered,recoveries,lastRecovery,batches}'
 ```
+
+接手进程依据**持久证据**对账：入口每次 commit 前都会把确认写入共享集群库
+（`binding-ack:<epoch>`）。因此即使此刻所有入口都探测不到，接手者也能凭 ack 查准批次状态：
+全部确认则采纳，确证无任一落地则丢弃，证据不足则**保留** `pending`（`retained=true`，
+可在 `/admin/state/raw` 查看）等下次恢复，绝不靠猜测误判。
 
 ### 3.3 协调器在切换中途崩溃（coordinator-crash-mid-switch）
 
@@ -134,6 +142,10 @@ curl -s $EA/requests/$RID | jq '{version,status,output}'
 curl -s -X POST $EA/submit -H 'content-type: application/json' \
      -d '{"group":"currency","input":4}' | jq '{version:.record.version,output:.record.output}'
 ```
+
+有入口离线时确认回退同样成功（切换只扇出到可达入口）。若该离线入口在**协调器停机期间**
+才恢复，它会直接从共享集群库读到回退后的权威绑定（不依赖协调器 HTTP），首条新请求即使用
+回退版本；协调器重启后再把掉队入口追平。已受理请求的后续执行与结果始终沿用首次受理版本。
 
 ### 3.5 执行服务重启后自愈（service-restart-recovery）
 
@@ -174,8 +186,10 @@ curl -s -X POST $EC/retry -H 'content-type: application/json' -d "{\"requestId\"
 
 | code | 含义 |
 |------|------|
-| `paused` | 暂停中，不能推进 |
+| `paused` | 暂停中，不能推进；或切换在 prepare 阶段被暂停中止 |
 | `blocked` | 本批所需服务不可用/不能执行目标版本（`blocked` 列表点名） |
+| `switch_pending` | 上一次切换仍在对账（如入口暂不可达），入口恢复后重试 |
+| `not_prepared` | 入口收到没有对应 prepare 的 commit（迟到结果，拒绝翻转） |
 | `rollback_pending` | 有回退待确认 |
 | `config_unavailable` | 入口拿不到钉住版本的配置（协调器与本地缓存都没有） |
 | `version_not_installed` | 执行服务没有该版本规则 |

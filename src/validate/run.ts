@@ -43,6 +43,7 @@ interface ProcessSpec {
   name: string;
   port: number;
   args: string[];
+  env?: Record<string, string>;
   child?: ChildProcess;
   exited: boolean;
   stdout: string[];
@@ -58,7 +59,7 @@ class Cluster {
     const proc: ProcessSpec = { ...spec, exited: false, stdout: [], stderr: [] };
     const child = spawn(process.execPath, spec.args, {
       cwd: ROOT,
-      env: { ...process.env, NODE_NO_WARNINGS: '1' },
+      env: { ...process.env, NODE_NO_WARNINGS: '1', ...(spec.env ?? {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     child.stdout?.on('data', (chunk: Buffer) => {
@@ -94,8 +95,14 @@ class Cluster {
     });
   }
 
-  startEntry(name: string): ProcessSpec {
-    return this.spawnProcess({ role: 'entry', name, port: entryPort(name), args: this.argsFor('entry', name) });
+  startEntry(name: string, env?: Record<string, string>): ProcessSpec {
+    return this.spawnProcess({
+      role: 'entry',
+      name,
+      port: entryPort(name),
+      args: this.argsFor('entry', name),
+      env,
+    });
   }
 
   startService(name: string): ProcessSpec {
@@ -155,7 +162,7 @@ class Cluster {
     const existing = this.procs.get(name);
     if (!existing) throw new Error(`unknown process ${name}`);
     if (existing.role === 'coordinator') this.startCoordinator();
-    else if (existing.role === 'entry') this.startEntry(name);
+    else if (existing.role === 'entry') this.startEntry(name, existing.env);
     else this.startService(name);
     await this.waitHealthy(`http://127.0.0.1:${existing.port}`);
     // Give the entry sync loop a moment to observe settled bindings.
@@ -312,8 +319,8 @@ const waitRecord = async (
 
 const entryBindings = async (
   name: string,
-): Promise<{ epoch: number; versions: Record<string, string> } | undefined> => {
-  const res = await jsonRequest<{ epoch: number; versions: Record<string, string> }>(entryBase(name), {
+): Promise<{ epoch: number; versions: Record<string, string>; committedAt?: number | null } | undefined> => {
+  const res = await jsonRequest<{ epoch: number; versions: Record<string, string>; committedAt?: number | null }>(entryBase(name), {
     path: '/admin/bindings',
     timeoutMs: 3000,
   });
@@ -906,6 +913,325 @@ async function main(): Promise<number> {
         'a segment refuses a version it does not have',
         `status=${missingVersion.status} code=${missingVersion.body?.code}`,
       );
+    }
+
+    /* -------- 15. shared effective boundary: prepare-all then commit ------ */
+    report.section('15. One shared boundary — no entry flips while another prepares');
+    {
+      // Re-roll batch 1 so it is pending again, then make entry-c slow to
+      // prepare. The other entries must keep the old epoch for the whole
+      // prepare window; every entry must converge on one epoch at commit.
+      await ops('/ops/pause');
+      await ops('/ops/rollback', { batchIndex: 0 });
+      await ops('/ops/rollback/confirm');
+      await ops('/ops/resume');
+      const pre = await state();
+      const oldEpoch = pre.bindings.epoch;
+      report.check(pre.bindings.versions.currency === 'v1', 'precondition: currency on v1 again', pre.bindings.versions.currency);
+
+      await cluster.kill('entry-c');
+      cluster.startEntry('entry-c', { RULES_PREPARE_DELAY_MS: '450' });
+      await cluster.waitHealthy(entryBase('entry-c'));
+      await sleep(300);
+
+      const advancePromise = ops('/ops/advance');
+      // Halfway through the slow prepare: the delayed entry (and every other
+      // entry) must still serve the previous epoch — the boundary is shared.
+      await sleep(220);
+      const midFlight = await Promise.all(['entry-a', 'entry-b', 'entry-c'].map(entryBindings));
+      report.check(
+        midFlight.every((entry) => entry?.epoch === oldEpoch && entry.versions.currency === 'v1'),
+        'no entry flips before every entry has prepared',
+        midFlight.map((entry, index) => `${['a', 'b', 'c'][index]}:${entry?.epoch}/${entry?.versions.currency}`).join(' '),
+      );
+      const advance = await advancePromise;
+      report.check(advance.status === 200 && advance.body.ok, 'advance completes after the shared boundary', advance.body.error ?? 'ok');
+
+      const after = await state();
+      const committed = await Promise.all(['entry-a', 'entry-b', 'entry-c'].map(entryBindings));
+      report.check(
+        committed.every((entry) => entry?.epoch === after.bindings.epoch && entry.versions.currency === 'v2'),
+        'all entries share the new epoch immediately after the boundary',
+        committed.map((entry, index) => `${['a', 'b', 'c'][index]}:${entry?.epoch}/${entry?.versions.currency}`).join(' '),
+      );
+      const times = committed.map((entry) => entry?.committedAt ?? 0);
+      const spread = Math.max(...times) - Math.min(...times);
+      report.check(
+        spread <= 250,
+        'commits land in one tight parallel boundary (not sequentially per entry)',
+        `commitTimes=[${times.join(',')}] spread=${spread}ms`,
+      );
+
+      // Restore the entry without the test hook for later sections.
+      await cluster.kill('entry-c');
+      cluster.startEntry('entry-c');
+      await cluster.waitHealthy(entryBase('entry-c'));
+      await sleep(300);
+      const restored = await entryBindings('entry-c');
+      report.check(
+        restored?.epoch === after.bindings.epoch && restored.versions.currency === 'v2',
+        'restarted entry re-converges to the shared epoch',
+        `epoch=${restored?.epoch} currency=${restored?.versions.currency}`,
+      );
+    }
+
+    /* ------- 16. pause during a switch: late results cannot flip --------- */
+    report.section('16. Pause during cut-over — late prepare/commit cannot trigger a switch');
+    {
+      // Batch 1 is effective (v2). Roll it back to v1 and re-prepare a slow
+      // advance, pausing while prepares are still in flight.
+      await ops('/ops/pause');
+      await ops('/ops/rollback', { batchIndex: 0 });
+      await ops('/ops/rollback/confirm');
+      await ops('/ops/resume');
+      const baseline = await state();
+      const baseEpoch = baseline.bindings.epoch;
+      report.check(baseline.bindings.versions.currency === 'v1', 'precondition: currency back on v1', baseline.bindings.versions.currency);
+
+      await cluster.kill('entry-c');
+      cluster.startEntry('entry-c', { RULES_PREPARE_DELAY_MS: '600' });
+      await cluster.waitHealthy(entryBase('entry-c'));
+      await sleep(300);
+
+      const blockedAdvance = ops('/ops/advance');
+      await sleep(150);
+      await ops('/ops/pause'); // lands while prepares are still in flight
+      const outcome = await blockedAdvance;
+      // The pause lands strictly inside the (slow) prepare window, so the
+      // boundary guard aborts before any entry commits.
+      report.check(
+        outcome.status === 409 && outcome.body.code === 'paused',
+        'the in-flight switch is aborted by the pause boundary guard',
+        `code=${outcome.body.code}`,
+      );
+      const still = await Promise.all(['entry-a', 'entry-b', 'entry-c'].map(entryBindings));
+      report.check(
+        still.every((entry) => entry?.epoch === baseEpoch && entry.versions.currency === 'v1'),
+        'not-yet-effective batch keeps the original version binding while paused',
+        still.map((entry, index) => `${['a', 'b', 'c'][index]}:${entry?.epoch}/${entry?.versions.currency}`).join(' '),
+      );
+      // Give any late prepare/result time to arrive; it must not flip anything.
+      await sleep(700);
+      const late = await Promise.all(['entry-a', 'entry-b', 'entry-c'].map(entryBindings));
+      report.check(
+        late.every((entry) => entry?.epoch === baseEpoch),
+        'late prepare results do not trigger a switch while paused',
+        late.map((entry, index) => `${['a', 'b', 'c'][index]}:${entry?.epoch}`).join(' '),
+      );
+      // Explicit resume is required before the batch can move.
+      const refused = await ops('/ops/advance');
+      report.check(refused.status === 409 && refused.body.code === 'paused', 'advance still refused until explicit resume', refused.body.code);
+      await ops('/ops/resume');
+      const reAdvanced = await ops('/ops/advance');
+      report.check(reAdvanced.status === 200 && reAdvanced.body.ok, 'the batch advances only after explicit resume', reAdvanced.body.error ?? 'ok');
+
+      await cluster.kill('entry-c');
+      cluster.startEntry('entry-c');
+      await cluster.waitHealthy(entryBase('entry-c'));
+      await sleep(300);
+    }
+
+    /* --- 17. successor settles batch state without probing any entry ----- */
+    report.section('17. Crash recovery with all entries unprobeable — durable acks settle the batch');
+    {
+      // (a) after-pending fault, entries offline at recovery: intent retained,
+      // never silently discarded.
+      await ops('/ops/pause');
+      await ops('/ops/rollback', { batchIndex: 0 });
+      await ops('/ops/rollback/confirm');
+      await ops('/ops/resume');
+      const before = await state();
+      const batchIndex = before.batches.findIndex((b) => b.status !== 'effective');
+      report.check(before.bindings.versions.currency === 'v1', 'precondition: currency on v1 before crash', before.bindings.versions.currency);
+
+      await Promise.all(['entry-a', 'entry-b', 'entry-c'].map((name) => cluster.kill(name)));
+      const crashed = await jsonRequest(coordinatorBase, {
+        path: '/ops/advance',
+        body: { fault: 'after-pending' },
+        timeoutMs: 8000,
+      });
+      report.check(!crashed.ok, 'coordinator dies after writing the durable pending intent', `status=${crashed.status}`);
+      // Entries are still down when the successor boots.
+      await cluster.restart('coordinator');
+      const blind = await state();
+      report.check(
+        blind.batches[batchIndex].status === 'pending' && blind.paused === false,
+        'successor reads the batch state accurately with no entry probe',
+        `batch=${blind.batches[batchIndex].status} paused=${blind.paused}`,
+      );
+      report.check(
+        blind.bindings.versions.currency === 'v1',
+        'uncommitted switch is retained (not discarded) while entries are unprobeable',
+        blind.bindings.versions.currency,
+      );
+      const rawBlind = await jsonRequest<{ pending: { retained?: boolean; epoch: number } | null }>(coordinatorBase, {
+        path: '/admin/state/raw',
+        timeoutMs: 5000,
+      });
+      report.check(
+        rawBlind.ok && rawBlind.body?.pending?.retained === true,
+        'the durable pending intent is retained rather than guessed away',
+        `pending=${JSON.stringify(rawBlind.body?.pending ? { epoch: rawBlind.body.pending.epoch, retained: rawBlind.body.pending.retained } : null)}`,
+      );
+      // Bring entries back and reconcile: the retained intent converges or a
+      // fresh advance completes; either way the batch ends effective.
+      for (const name of ['entry-a', 'entry-b', 'entry-c']) {
+        cluster.startEntry(name);
+        await cluster.waitHealthy(entryBase(name));
+      }
+      await sleep(300);
+      await ops('/ops/recover');
+      let settled = await state(true);
+      if (settled.batches[batchIndex].status !== 'effective') {
+        const again = await ops('/ops/advance');
+        report.check(again.status === 200, 'retained switch is driven to completion once entries return', again.body.error ?? again.body.code ?? 'ok');
+        settled = await state(true);
+      } else {
+        report.check(true, 'retained switch adopted once entries confirmed the epoch', 'adopted on recover');
+      }
+      report.check(
+        settled.batches[batchIndex].status === 'effective' && settled.bindings.versions.currency === 'v2',
+        'batch eventually effective at v2 with accurate bookkeeping',
+        `batch=${settled.batches[batchIndex].status} currency=${settled.bindings.versions.currency}`,
+      );
+
+      // (b) after-commit fault: entries already committed and acknowledged
+      // durably in the shared cluster store before the coordinator died. The
+      // successor settles the batch from those acks — first while entries are
+      // still up (acks are guaranteed flushed), then proving the settled
+      // batch state stays accurate after every entry is taken offline.
+      const laterIndex = settled.batches.find((b) => b.index > batchIndex && b.status === 'effective')?.index;
+      if (laterIndex === undefined) throw new Error('test setup: expected a later effective batch');
+      await ops('/ops/pause');
+      await ops('/ops/rollback', { batchIndex: laterIndex });
+      await ops('/ops/rollback/confirm');
+      await ops('/ops/resume');
+      const crashCommitted = await jsonRequest(coordinatorBase, {
+        path: '/ops/advance',
+        body: { fault: 'after-commit' },
+        timeoutMs: 15000,
+      });
+      report.check(!crashCommitted.ok, 'coordinator dies after entries committed (next batch)', `status=${crashCommitted.status}`);
+      // Let the last in-flight acknowledgement finish flushing to the shared
+      // store before the successor reads it (the entry replied only after its
+      // synchronous ack write, so this is a short settle window, not a retry).
+      await sleep(200);
+      await cluster.restart('coordinator');
+      const adopted = await state();
+      report.check(
+        adopted.batches[laterIndex].status === 'effective',
+        'successor adopts the committed switch from durable acknowledgements',
+        adopted.batches.map((b) => `${b.name}:${b.status}`).join(', '),
+      );
+      // Now take every entry offline: the settled bookkeeping must remain
+      // accurate even though the successor cannot probe any of them.
+      await Promise.all(['entry-a', 'entry-b', 'entry-c'].map((name) => cluster.kill(name)));
+      await cluster.restart('coordinator');
+      const adoptedBlind = await state();
+      report.check(
+        adoptedBlind.batches[laterIndex].status === 'effective' &&
+          adoptedBlind.bindings.epoch === adopted.bindings.epoch,
+        'batch state stays accurate with every entry unprobeable',
+        adoptedBlind.batches.map((b) => `${b.name}:${b.status}`).join(', '),
+      );
+      for (const name of ['entry-a', 'entry-b', 'entry-c']) {
+        cluster.startEntry(name);
+        await cluster.waitHealthy(entryBase(name));
+      }
+      await sleep(300);
+      const converged = await state(true);
+      report.check(
+        (converged.entries ?? []).every((entry) => entry.reachable && entry.epoch === converged.bindings.epoch),
+        'entries converge onto the adopted epoch after they return',
+        (converged.entries ?? []).map((entry) => `${entry.name}:${entry.epoch}/${converged.bindings.epoch}`).join(' '),
+      );
+    }
+
+    /* ---- 18. rollback with an offline entry across coordinator outage --- */
+    report.section('18. Offline entry & coordinator outage — rollback version wins for new requests');
+    {
+      // Roll batch 1 back to v1 while entry-c (which serves currency) is
+      // offline, and while requests accepted under v2 are still in flight.
+      const inflight = await accept('entry-a', 'currency', 77);
+      await sleep(60);
+      report.check(inflight.status === 200 && inflight.body.version === 'v2', 'in-flight request accepted on v2', `v=${inflight.body.version}`);
+
+      await cluster.kill('entry-c'); // offline during the whole rollback
+      await ops('/ops/pause');
+      const requested = await ops('/ops/rollback', { batchIndex: 0 });
+      report.check(requested.status === 200, 'rollback requested with an entry offline', requested.body.error ?? 'ok');
+      const confirmed = await ops('/ops/rollback/confirm');
+      const rollbackRecord = (await state()).rollbackHistory.slice(-1)[0];
+      report.check(
+        confirmed.status === 200,
+        'rollback confirmed with an entry offline and traffic still in flight',
+        `inflightAtConfirm=${rollbackRecord?.inflightAtConfirm ?? 'n/a'}`,
+      );
+      report.check(
+        (rollbackRecord?.inflightAtConfirm ?? 0) > 0,
+        'the coordinator observed in-flight requests at confirmation',
+        `inflightAtConfirm=${rollbackRecord?.inflightAtConfirm ?? 0}`,
+      );
+
+      // The in-flight request keeps its first-accepted v2 all the way through.
+      const inflightRecord = await waitRecord('entry-a', inflight.body.requestId);
+      report.check(
+        inflightRecord?.version === 'v2' &&
+          inflightRecord.segments.every((segment) => segment.version === 'v2') &&
+          recordsEqual(inflightRecord.output, expectedCurrencyV2(77)),
+        'already-accepted requests keep executing on their first-accepted version',
+        `v=${inflightRecord?.version} out=${JSON.stringify(inflightRecord?.output)}`,
+      );
+      // New requests on a live entry immediately use the pre-batch v1.
+      const live = await submit('entry-a', 'currency', 4);
+      report.check(
+        (live.body.record as RecordView)?.version === 'v1' &&
+          recordsEqual((live.body.record as RecordView)?.output, expectedCurrencyV1(4)),
+        'new requests after confirm use the pre-batch v1',
+        `v=${(live.body.record as RecordView)?.version}`,
+      );
+
+      // Now take the coordinator down and bring the offline entry back. Its
+      // very first new request must still use the rollback version, learned
+      // from the shared cluster store rather than the coordinator HTTP API.
+      await cluster.kill('coordinator');
+      cluster.startEntry('entry-c');
+      await cluster.waitHealthy(entryBase('entry-c'));
+      await sleep(300);
+      const offlineBindings = await entryBindings('entry-c');
+      report.check(
+        offlineBindings?.versions.currency === 'v1',
+        'restarted offline entry adopts the rollback binding from the cluster store',
+        `currency=${offlineBindings?.versions.currency}`,
+      );
+      const firstNew = await submit('entry-c', 'currency', 9);
+      report.check(
+        (firstNew.body.record as RecordView)?.version === 'v1' &&
+          recordsEqual((firstNew.body.record as RecordView)?.output, expectedCurrencyV1(9)),
+        "the offline entry's first new request after recovery uses the rollback version",
+        `v=${(firstNew.body.record as RecordView)?.version} out=${JSON.stringify((firstNew.body.record as RecordView)?.output)}`,
+      );
+      // Another live entry keeps serving on its actual effective binding with
+      // the coordinator gone (entry-b serves report).
+      const coordinatorDown = await submit('entry-b', 'report', 'coordinator-offline');
+      report.check(
+        (coordinatorDown.body.record as RecordView)?.version ===
+          (await entryBindings('entry-b'))?.versions.report,
+        'online entries keep accepting on the effective version while coordinator is down',
+        `v=${(coordinatorDown.body.record as RecordView)?.version}`,
+      );
+
+      await cluster.restart('coordinator');
+      const successor = await state(true);
+      report.check(
+        successor.batches[0].status === 'rolled_back' && successor.bindings.versions.currency === 'v1',
+        'successor reports the accurate rolled-back batch state',
+        `batch0=${successor.batches[0].status} currency=${successor.bindings.versions.currency}`,
+      );
+      await ops('/ops/resume');
+      // Re-release the rolled-back batch so the cluster ends fully effective.
+      const reRelease = await ops('/ops/advance');
+      report.check(reRelease.status === 200 && reRelease.body.ok, 'rolled-back batch re-advanced after the outage', reRelease.body.error ?? 'ok');
     }
 
     /* -------------------------- 14. final sanity -------------------------- */

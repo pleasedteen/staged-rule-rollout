@@ -280,6 +280,39 @@ export class CoordinatorRepository {
   }
 }
 
+/**
+ * Durable binding-commit acknowledgements.
+ *
+ * When an entry commits an epoch it records the full binding view in the
+ * *shared* cluster store before replying. A coordinator successor can then
+ * establish what actually took effect without probing any entry — this is
+ * what keeps batch state accurate while every entry is temporarily
+ * unreachable after a crash.
+ */
+export class BindingAckRepository {
+  constructor(private readonly store: KvStore) {}
+
+  private key(epoch: number): string {
+    return `binding-ack:${epoch}`;
+  }
+
+  /** Idempotent durable acknowledgement of one entry's commit. */
+  acknowledge(epoch: number, entry: string, view: BindingsView): void {
+    const map = this.store.get<Record<string, BindingsView>>(this.key(epoch)) ?? {};
+    map[entry] = { ...view, updatedAt: Date.now() };
+    this.store.set(this.key(epoch), map);
+  }
+
+  committedEntries(epoch: number): string[] {
+    const map = this.store.get<Record<string, BindingsView>>(this.key(epoch));
+    return map ? Object.keys(map).sort() : [];
+  }
+
+  view(epoch: number, entry: string): BindingsView | undefined {
+    return this.store.get<Record<string, BindingsView>>(this.key(epoch))?.[entry];
+  }
+}
+
 /* -------------------------------- Config ---------------------------------- */
 
 export class ConfigRepository {

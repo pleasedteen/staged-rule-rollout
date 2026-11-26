@@ -104,6 +104,17 @@ export interface PendingSwitch {
   digests: Record<Version, string>;
   /** Bindings in force before this switch; used to abort cleanly. */
   previous: BindingsView;
+  /**
+   * Entries whose commit of this epoch is durably acknowledged in the shared
+   * cluster store. Lets a successor settle the switch correctly even when no
+   * entry is currently probeable.
+   */
+  committedEntries?: string[];
+  /**
+   * Set while the intent is retained across a recovery that could not yet
+   * prove it landed or failed (e.g. every entry was temporarily unreachable).
+   */
+  retained?: boolean;
 }
 
 export interface CoordinatorState {

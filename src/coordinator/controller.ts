@@ -19,7 +19,7 @@ import type {
   Version,
 } from '../shared/types';
 import type { ConfigRepository, CoordinatorRepository } from '../shared/store';
-import { TransportLedger } from '../shared/store';
+import { BindingAckRepository, TransportLedger } from '../shared/store';
 import { requiredServices, validateConfigDocument, walkRoute } from '../shared/engine';
 import { jsonRequest } from '../shared/http';
 import { PeerClient } from '../shared/peer';
@@ -58,6 +58,7 @@ export interface DeployResult {
 export class ReleaseController {
   private state: CoordinatorState;
   private recoveryPerformed = false;
+  private readonly acks: BindingAckRepository;
 
   constructor(
     private readonly topology: Topology,
@@ -66,6 +67,7 @@ export class ReleaseController {
     private readonly peers = new PeerClient(),
   ) {
     this.state = this.repo.loadState() ?? this.blankState();
+    this.acks = new BindingAckRepository(repo.store);
   }
 
   private blankState(): CoordinatorState {
@@ -139,6 +141,11 @@ export class ReleaseController {
   /**
    * Reconcile persisted state with what entries actually run. Called on every
    * boot of an existing state; a no-op when there is nothing to reconcile.
+   *
+   * A pending switch is settled on durable evidence rather than guessed:
+   * entries acknowledge each commit in the shared cluster store, so even when
+   * no entry is currently probeable the successor can still tell whether the
+   * switch landed. An unprovable switch is *retained*, never discarded.
    */
   async recover(): Promise<void> {
     if (this.state.plan.releaseId === 'unset') return;
@@ -147,8 +154,8 @@ export class ReleaseController {
 
     if (this.state.pending) {
       const pending = this.state.pending;
-      const committed = await this.resolvePending(pending, entries);
-      if (committed) {
+      const verdict = await this.resolvePending(pending, entries);
+      if (verdict === 'committed') {
         this.repo.saveBindings({
           versions: pending.versions,
           digests: pending.digests,
@@ -157,11 +164,27 @@ export class ReleaseController {
         });
         this.finishPending(pending);
         notes.push(`pending ${pending.kind} of batch ${pending.batchIndex} had committed; adopted`);
-      } else {
+      } else if (verdict === 'discard') {
         this.state.pending = null;
         this.saveState();
         notes.push(
           `pending ${pending.kind} of batch ${pending.batchIndex} had not committed; discarded`,
+        );
+      } else {
+        // retain: re-assert the durable intent so reachable entries converge,
+        // and keep the intent for a later recovery when entries are probeable.
+        pending.retained = true;
+        pending.committedEntries = this.acks.committedEntries(pending.epoch);
+        this.saveState();
+        const failures = await this.pushBindings({
+          versions: pending.versions,
+          digests: pending.digests,
+          epoch: pending.epoch,
+          updatedAt: Date.now(),
+        });
+        notes.push(
+          `pending ${pending.kind} of batch ${pending.batchIndex} retained (entries unreachable/unsettled` +
+            `${failures.length ? `; unacked: ${failures.join(', ')}` : ''})`,
         );
       }
     }
@@ -192,27 +215,70 @@ export class ReleaseController {
     this.saveState();
   }
 
+  /**
+   * Decide the fate of a durable pending switch.
+   *
+   *   committed — every topology entry has the epoch (probed live or proven by
+   *               its durable acknowledgement in the shared cluster store);
+   *   discard   — positive evidence that nothing committed (all probeable
+   *               entries still run an older epoch and no ack exists);
+   *   retain    — unprovable right now, e.g. every entry is unreachable.
+   */
   private async resolvePending(
     pending: PendingSwitch,
     entries: EntryBindingView[],
-  ): Promise<boolean> {
+  ): Promise<'committed' | 'discard' | 'retain'> {
+    const durableAcks = new Set(this.acks.committedEntries(pending.epoch));
+    const allEntryNames = this.topology.entries.map((entry) => entry.name).sort();
     const reachable = entries.filter((entry) => entry.reachable && entry.epoch !== null);
-    if (reachable.length === 0) {
-      return this.repo.loadBindings()?.epoch === pending.epoch;
+
+    // Durable proof path: every entry acknowledged this exact epoch before any
+    // crash. Works even if none of them can be probed at the moment.
+    const allAcked =
+      allEntryNames.length > 0 && allEntryNames.every((name) => durableAcks.has(name));
+    if (allAcked) {
+      pending.committedEntries = allEntryNames;
+      return 'committed';
     }
-    const committed = reachable.filter((entry) => (entry.epoch ?? -1) >= pending.epoch);
-    if (committed.length === reachable.length) return true;
-    if (committed.length === 0) return false;
-    // Mixed: predecessor died mid-fan-out. Re-push to converge on the durable
-    // intent; entries already committed are idempotent for the same epoch.
-    const bindings: BindingsView = {
+
+    if (reachable.length === 0) {
+      // No entry can be probed. The durable binding view may already equal the
+      // pending epoch (crash after saveBindings, before bookkeeping); adopt.
+      if (this.repo.loadBindings()?.epoch === pending.epoch && durableAcks.size > 0) {
+        pending.committedEntries = [...durableAcks].sort();
+        return 'committed';
+      }
+      // Without any evidence we must not guess: retain for the next recovery.
+      return 'retain';
+    }
+
+    const liveCommitted = reachable.filter((entry) => (entry.epoch ?? -1) >= pending.epoch);
+    const liveStale = reachable.filter((entry) => (entry.epoch ?? -1) < pending.epoch);
+    const ackedButOffline = allEntryNames.filter(
+      (name) => durableAcks.has(name) && !reachable.some((entry) => entry.name === name),
+    );
+
+    if (liveCommitted.length === reachable.length && ackedButOffline.length === 0) {
+      pending.committedEntries = [...new Set([...durableAcks, ...liveCommitted.map((e) => e.name)])].sort();
+      return 'committed';
+    }
+    if (liveStale.length === reachable.length && durableAcks.size === 0) {
+      return 'discard';
+    }
+    // Mixed or partial: predecessor died mid-fan-out. Re-push to converge on
+    // the durable intent; entries already committed are idempotent for the
+    // same epoch. Keep the pending until a later recovery proves settlement.
+    const failures = await this.pushBindings({
       versions: pending.versions,
       digests: pending.digests,
       epoch: pending.epoch,
       updatedAt: Date.now(),
-    };
-    const failures = await this.pushBindings(bindings);
-    return failures.length === 0;
+    });
+    if (failures.length === 0 && liveStale.length === 0) {
+      pending.committedEntries = allEntryNames;
+      return 'committed';
+    }
+    return 'retain';
   }
 
   private finishPending(pending: PendingSwitch): void {
@@ -403,7 +469,21 @@ export class ReleaseController {
     if (this.state.paused) {
       return { ok: false, code: 'paused', error: 'release is paused; resume before advancing' };
     }
-    if (this.state.pending) await this.recover();
+    if (this.state.pending) {
+      await this.recover();
+      // An intent that could not be settled (e.g. every entry was briefly
+      // unreachable) must not be overwritten by a new advance; the operator
+      // retries once the cluster is reachable.
+      if (this.state.pending) {
+        return {
+          ok: false,
+          code: 'switch_pending',
+          error: `a ${this.state.pending.kind} switch for batch ${this.state.pending.batchIndex} is still reconciling; retry after entries are reachable`,
+          batchIndex: this.state.pending.batchIndex,
+          state: this.viewBase(),
+        };
+      }
+    }
 
     const next = this.nextAdvanceIndex();
     if (next === null) {
@@ -481,9 +561,18 @@ export class ReleaseController {
 
     const outcome = await this.pushSwitch(pending);
     if (!outcome.ok) {
-      this.state.pending = null;
-      batch.status = 'pending';
-      this.saveState();
+      if (outcome.code === 'entry_commit_failed') {
+        // Some entries may have committed: keep the intent so recovery (or the
+        // next advance) converges every entry onto the same epoch.
+        batch.status = 'switching';
+        this.state.pending = { ...pending };
+        this.saveState();
+      } else {
+        // Prepare-phase failure / pause race: nothing committed, drop intent.
+        this.state.pending = null;
+        batch.status = 'pending';
+        this.saveState();
+      }
       return {
         ok: false,
         code: outcome.code,
@@ -606,11 +695,18 @@ export class ReleaseController {
       }
     }
 
-    const outcome = await this.pushSwitch(pending);
+    const outcome = await this.pushSwitch(pending, { allowWhilePaused: true });
     if (!outcome.ok) {
-      this.state.pending = null;
-      rollback.status = 'requested';
-      this.saveState();
+      if (outcome.code === 'entry_commit_failed') {
+        // Partial rollback commit: keep the intent so recovery converges every
+        // entry onto the pre-batch bindings.
+        this.state.pending = { ...pending };
+        this.saveState();
+      } else {
+        this.state.pending = null;
+        rollback.status = 'requested';
+        this.saveState();
+      }
       return {
         ok: false,
         code: outcome.code,
@@ -734,20 +830,34 @@ export class ReleaseController {
   }
 
   /**
-   * Push bindings to reachable entries via prepare → commit.
+   * Push bindings to reachable entries via a strict two-phase cut-over:
+   *
+   *   phase 1 — prepare EVERY reachable entry (with bounded retries). Not one
+   *             entry flips here; each only stages the map and warms configs.
+   *             If any entry cannot prepare, the whole switch is aborted and
+   *             every staged entry is told to discard the epoch;
+   *   phase 2 — only after every prepare succeeded, fan out the commits. The
+   *             commits run in parallel so all groups' new requests share one
+   *             effective boundary; an entry never sees a partial map.
+   *
+   * A pause landing between the phases aborts the switch instead of letting
+   * late prepares/commits trigger a flip. Commits are acknowledged durably by
+   * the entries in the shared cluster store and recorded on the pending
+   * intent, so a crash at any point is recoverable without live probes.
    *
    * Service-level config installation is done by the caller (it differs
-   * between advance and rollback); this step only flips entry bindings, which
-   * is the shared batch boundary.
+   * between advance and rollback); this step only flips entry bindings.
    */
-  private async pushSwitch(pending: PendingSwitch): Promise<{
+  private async pushSwitch(
+    pending: PendingSwitch,
+    options: { allowWhilePaused?: boolean } = {},
+  ): Promise<{
     ok: boolean;
     code?: string;
     error?: string;
     blocked?: BlockedReason[];
     acks: EntryAck[];
   }> {
-
     const reachable = await this.reachableEntries();
     if (reachable.length === 0) {
       return { ok: false, code: 'entries_unreachable', error: 'no entry is reachable', acks: [] };
@@ -758,7 +868,9 @@ export class ReleaseController {
       versions: pending.versions,
       digests: pending.digests,
     };
-    const acks: EntryAck[] = [];
+
+    /* ---------------- phase 1: prepare every reachable entry --------------- */
+    const prepared: EntryProcessDef[] = [];
     const prepareFailures: string[] = [];
     await Promise.all(
       reachable.map(async (entry) => {
@@ -767,40 +879,93 @@ export class ReleaseController {
         for (let attempt = 0; attempt < 4; attempt += 1) {
           const result = await this.peers.prepare(url, payload);
           if (result.ok) {
-            const committed = await this.peers.commit(url, pending.epoch);
-            if (committed.ok) {
-              const observed = await this.peers.bindings(url);
-              acks.push({ entry: entry.name, ok: true, epoch: observed.epoch });
-              return;
-            }
-            lastError = committed.error ?? 'commit failed';
-          } else {
-            lastError = result.error ?? 'prepare failed';
+            prepared.push(entry);
+            return;
           }
+          lastError = result.error ?? 'prepare failed';
           await sleep(80);
         }
         prepareFailures.push(`${entry.name} (${lastError})`);
+      }),
+    );
+
+    if (prepareFailures.length > 0) {
+      // Nothing may commit: tell every staged entry to discard this epoch so a
+      // late commit can never resurrect an aborted switch.
+      await this.abortSwitch(pending, prepared);
+      return {
+        ok: false,
+        code: 'entry_prepare_failed',
+        error: `entries failed to prepare epoch ${pending.epoch}: ${prepareFailures.join(', ')}`,
+        acks: [],
+      };
+    }
+
+    // Shared boundary guard: a pause (or an external state change) landing
+    // during the prepare fan-out must prevent any commit. Rollback
+    // confirmation is explicitly allowed while paused.
+    if (this.state.paused && !options.allowWhilePaused) {
+      await this.abortSwitch(pending, prepared);
+      return {
+        ok: false,
+        code: 'paused',
+        error: 'release was paused before the cut-over boundary; switch aborted',
+        acks: [],
+      };
+    }
+
+    /* ---------------- phase 2: one parallel commit boundary ---------------- */
+    const acks: EntryAck[] = [];
+    const commitFailures: string[] = [];
+    await Promise.all(
+      prepared.map(async (entry) => {
+        const url = `http://127.0.0.1:${entry.port}`;
+        let lastError = 'commit failed';
+        for (let attempt = 0; attempt < 4; attempt += 1) {
+          const committed = await this.peers.commit(url, pending.epoch);
+          if (committed.ok) {
+            const observed = await this.peers.bindings(url);
+            acks.push({ entry: entry.name, ok: true, epoch: observed.epoch });
+            // Record the durable acknowledgement on the intent immediately; a
+            // crash later still leaves the evidence in the cluster store.
+            const names = new Set(this.acks.committedEntries(pending.epoch));
+            names.add(entry.name);
+            pending.committedEntries = [...names].sort();
+            this.state.pending = { ...pending };
+            this.repo.saveState(this.state);
+            return;
+          }
+          lastError = committed.error ?? 'commit failed';
+          await sleep(80);
+        }
+        commitFailures.push(`${entry.name} (${lastError})`);
         acks.push({ entry: entry.name, ok: false, error: lastError });
       }),
     );
 
-    if (prepareFailures.length === reachable.length) {
+    if (commitFailures.length > 0) {
+      // Keep the durable intent: recovery converges the stragglers onto the
+      // same epoch instead of leaving a half-flipped cluster unmanaged.
       return {
         ok: false,
-        code: 'entries_failed',
-        error: `no entry accepted epoch ${pending.epoch}: ${prepareFailures.join(', ')}`,
+        code: 'entry_commit_failed',
+        error: `entries failed to commit epoch ${pending.epoch}: ${commitFailures.join(', ')}`,
         acks,
       };
     }
-    if (prepareFailures.length > 0) {
-      return {
-        ok: false,
-        code: 'entry_prepare_failed',
-        error: `entries failed to switch: ${prepareFailures.join(', ')}`,
-        acks,
-      };
-    }
+    pending.committedEntries = prepared.map((entry) => entry.name).sort();
+    this.state.pending = { ...pending };
+    this.repo.saveState(this.state);
     return { ok: true, acks };
+  }
+
+  /** Discard a staged epoch on every entry that prepared it. Best-effort. */
+  private async abortSwitch(pending: PendingSwitch, entries: EntryProcessDef[]): Promise<void> {
+    await Promise.all(
+      entries.map(async (entry) => {
+        await this.peers.abort(`http://127.0.0.1:${entry.port}`, pending.epoch).catch(() => undefined);
+      }),
+    );
   }
 
   /** Re-assert bindings (recovery / entry catch-up); best-effort. */

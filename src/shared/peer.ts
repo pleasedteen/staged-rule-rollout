@@ -69,6 +69,19 @@ export class PeerClient {
     return { ok: true };
   }
 
+  /** Discard a staged (prepared but not committed) epoch on an entry. */
+  async abort(url: string, epoch: number): Promise<{ ok: boolean; error?: string }> {
+    const res = await jsonRequest<{ ok: boolean; error?: string }>(url, {
+      path: '/admin/abort',
+      body: { epoch },
+      timeoutMs: this.timeoutMs,
+    });
+    if (!res.ok || !res.body?.ok) {
+      return { ok: false, error: res.body?.error ?? res.error ?? `status ${res.status}` };
+    }
+    return { ok: true };
+  }
+
   async installConfig(
     url: string,
     doc: ConfigDocument,
