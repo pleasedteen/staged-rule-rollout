@@ -244,6 +244,24 @@ export function localStorePath(dataDir: string, processId: string): string {
   return `${dataDir}/local/${processId}.sqlite`;
 }
 
+/**
+ * Journal file shared by every instance of one service.
+ *
+ * Instances of a service must agree on what has already been executed: if an
+ * instance durably writes a unit's result and then dies before its
+ * acknowledgement reaches the entry, a retry that lands on a sibling instance
+ * has to read the very same result instead of doing the work again. The file
+ * is per service (not per process) and uses the multi-process-safe
+ * lock+atomic-rename engine for the same reason the cluster store does.
+ */
+export function serviceJournalPath(dataDir: string, serviceName: string): string {
+  return `${dataDir}/journal/${serviceName}.json`;
+}
+
+export function openServiceJournalStore(dataDir: string, serviceName: string): KvStore {
+  return new FileKvStore(serviceJournalPath(dataDir, serviceName));
+}
+
 export function wipeStore(dataDir: string): void {
   for (const file of [clusterStorePath(dataDir)]) {
     for (const suffix of ['', '-journal', '-wal', '-shm', '.lock', '.tmp']) {
@@ -251,6 +269,7 @@ export function wipeStore(dataDir: string): void {
     }
   }
   rmSync(`${dataDir}/local`, { recursive: true, force: true });
+  rmSync(`${dataDir}/journal`, { recursive: true, force: true });
 }
 
 /* ------------------------------- Coordinator ------------------------------- */
@@ -388,6 +407,12 @@ export interface JournalEntry {
   state: 'pending' | 'done';
   /** True if the unit was completed by the boot-time healer. */
   healed?: boolean;
+  /**
+   * Instance that first persisted this unit. It may differ from the instance
+   * answering a later call when the original died between the durable write
+   * and its acknowledgement.
+   */
+  originInstance?: string;
   createdAt: number;
   updatedAt: number;
   bootInstance: string;

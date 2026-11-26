@@ -13,6 +13,7 @@ import type {
   ReleasePlan,
   ReleaseStateView,
   RollbackState,
+  ServiceInstanceView,
   ServiceName,
   ServiceReadinessView,
   Topology,
@@ -24,12 +25,25 @@ import { requiredServices, validateConfigDocument, walkRoute } from '../shared/e
 import { jsonRequest } from '../shared/http';
 import { PeerClient } from '../shared/peer';
 import { errorMessage, sleep } from '../shared/util';
+import { instanceUrl, instancesOf } from '../shared/runtime';
 
 export interface DeployResult {
   ok: boolean;
   version: Version;
+  /** Instance names that accepted the config. */
   installed: string[];
+  /** Per-service summary: true when at least one instance can run the version. */
+  services: { service: ServiceName; ready: boolean; instances: string[] }[];
   failed: { service: string; error: string }[];
+}
+
+interface ServiceInstallResult {
+  /** At least one instance is reachable and can execute the version after install. */
+  ready: boolean;
+  reachable: string[];
+  /** Every reachable instance that now has the config. */
+  installed: string[];
+  failures: { instance: string; error: string }[];
 }
 
 /**
@@ -358,6 +372,7 @@ export class ReleaseController {
         ok: false,
         version,
         installed: [],
+        services: [],
         failed: [{ service: '*', error: `config ${version} not published` }],
       };
     }
@@ -366,18 +381,30 @@ export class ReleaseController {
       (service) => !only || only.includes(service.name),
     );
     const installed: string[] = [];
+    const services: DeployResult['services'] = [];
     const failed: { service: string; error: string }[] = [];
-    await Promise.all(
-      targets.map(async (service) => {
-        const url = `http://127.0.0.1:${service.port}`;
-        const result = await this.peers.installConfig(url, doc, meta?.digest);
-        if (result.ok) installed.push(service.name);
-        else failed.push({ service: service.name, error: result.error ?? 'install failed' });
-      }),
+    const results = await Promise.all(
+      targets.map(async (service) => ({
+        service: service.name,
+        result: await this.installOnInstances(doc, service.name, meta?.digest),
+      })),
     );
+    for (const { service, result } of results) {
+      installed.push(...result.installed);
+      services.push({ service, ready: result.ready, instances: result.reachable });
+      if (!result.ready) {
+        failed.push({
+          service,
+          error:
+            result.reachable.length === 0
+              ? 'no instance reachable'
+              : result.failures.map((failure) => `${failure.instance}: ${failure.error}`).join('; '),
+        });
+      }
+    }
     installed.sort();
     failed.sort((a, b) => a.service.localeCompare(b.service));
-    return { ok: failed.length === 0, version, installed, failed };
+    return { ok: failed.length === 0, version, installed, services, failed };
   }
 
   /**
@@ -659,9 +686,49 @@ export class ReleaseController {
     return digests;
   }
 
-  private serviceUrl(name: string): string | undefined {
-    const service = this.topology.services.find((candidate) => candidate.name === name);
-    return service ? `http://127.0.0.1:${service.port}` : undefined;
+  /**
+   * Install one doc on every reachable instance of a service.
+   *
+   * Rules are configured by service name, so all instances share the doc; but
+   * because any instance may serve any request, each one has to receive the
+   * version before it can take over. Returns whether at least one instance can
+   * execute the version afterwards, which is the release-readiness criterion.
+   */
+  private async installOnInstances(
+    doc: ConfigDocument,
+    name: ServiceName,
+    digest?: string,
+  ): Promise<ServiceInstallResult> {
+    const instances = instancesOf(this.topology, name);
+    if (instances.length === 0) {
+      return { ready: false, reachable: [], installed: [], failures: [] };
+    }
+    const outcomes = await Promise.all(
+      instances.map(async (instance) => {
+        const url = instanceUrl(this.topology, name, instance.name);
+        const shoved = await this.peers.installConfig(url, doc, digest);
+        if (!shoved.ok) return { instance: instance.name, reachable: false, ok: false, error: shoved.error };
+        const info = await this.peers.serviceInfo(url);
+        if (!info.ok) {
+          return { instance: instance.name, reachable: true, ok: false, error: info.error ?? 'unreachable after install' };
+        }
+        const has = info.versions.includes(doc.version);
+        return {
+          instance: instance.name,
+          reachable: true,
+          ok: has,
+          error: has ? undefined : `cannot execute ${doc.version} (has ${info.versions.join(', ') || 'none'})`,
+        };
+      }),
+    );
+    return {
+      ready: outcomes.some((outcome) => outcome.ok),
+      reachable: outcomes.filter((outcome) => outcome.reachable).map((outcome) => outcome.instance),
+      installed: outcomes.filter((outcome) => outcome.ok).map((outcome) => outcome.instance),
+      failures: outcomes
+        .filter((outcome) => !outcome.ok && outcome.error)
+        .map((outcome) => ({ instance: outcome.instance, error: outcome.error as string })),
+    };
   }
 
   /** Install one doc on the given services; returns the failures. */
@@ -671,27 +738,34 @@ export class ReleaseController {
   ): Promise<BlockedReason[]> {
     const meta = this.configs.meta(doc.version);
     const blocked: BlockedReason[] = [];
-    await Promise.all(
-      names.map(async (name) => {
-        const url = this.serviceUrl(name);
-        if (!url) {
-          blocked.push({ service: name, reason: 'not present in topology' });
-          return;
-        }
-        const installed = await this.peers.installConfig(url, doc, meta?.digest);
-        if (!installed.ok) {
-          blocked.push({ service: name, reason: installed.error ?? 'install failed' });
-        }
-      }),
+    const results = await Promise.all(
+      names.map(async (name) => ({
+        name,
+        result: await this.installOnInstances(doc, name, meta?.digest),
+      })),
     );
+    for (const { name, result } of results) {
+      if (!result.ready) {
+        blocked.push({
+          service: name,
+          reason:
+            result.reachable.length === 0
+              ? 'no instance reachable'
+              : `no instance can execute ${doc.version}: ${result.failures
+                  .map((failure) => `${failure.instance} (${failure.error})`)
+                  .join(', ')}`,
+        });
+      }
+    }
     blocked.sort((a, b) => a.service.localeCompare(b.service));
     return blocked;
   }
 
   /**
-   * Ensure every service this batch's groups need is reachable and can execute
-   * `version`: install the doc, then re-verify. Services used only by other
-   * batches are never touched, so their downtime cannot stall this batch.
+   * Ensure every service this batch's groups need has at least one instance
+   * that can execute `version`: install on all reachable instances, then
+   * re-verify. Services used only by other batches are never touched, so their
+   * downtime cannot stall this batch.
    */
   async ensureServicesForBatch(batch: BatchState, version: Version): Promise<BlockedReason[]> {
     const doc = this.configs.get(version);
@@ -701,32 +775,17 @@ export class ReleaseController {
     const blocked: BlockedReason[] = [];
     await Promise.all(
       names.map(async (name) => {
-        const url = this.serviceUrl(name);
-        if (!url) {
-          blocked.push({ service: name, reason: 'not present in topology' });
-          return;
-        }
-        const before = await this.peers.serviceInfo(url);
-        if (!before.ok) {
-          blocked.push({ service: name, reason: `unreachable: ${before.error ?? 'no response'}` });
-          return;
-        }
-        const installed = await this.peers.installConfig(url, doc, meta?.digest);
-        if (!installed.ok) {
-          blocked.push({ service: name, reason: `install failed: ${installed.error}` });
-          return;
-        }
-        const after = await this.peers.serviceInfo(url);
-        if (!after.ok) {
-          blocked.push({ service: name, reason: `unreachable after install: ${after.error}` });
-          return;
-        }
-        if (!after.versions.includes(version)) {
-          blocked.push({
-            service: name,
-            reason: `cannot execute ${version} (has ${after.versions.join(', ') || 'none'})`,
-          });
-        }
+        const result = await this.installOnInstances(doc, name, meta?.digest);
+        if (result.ready) return;
+        blocked.push({
+          service: name,
+          reason:
+            result.reachable.length === 0
+              ? 'no instance reachable'
+              : `no instance can execute ${version}: ${result.failures
+                  .map((failure) => `${failure.instance} (${failure.error})`)
+                  .join(', ')}`,
+        });
       }),
     );
     blocked.sort((a, b) => a.service.localeCompare(b.service));
@@ -887,9 +946,34 @@ export class ReleaseController {
   async probeServices(): Promise<ServiceReadinessView[]> {
     return Promise.all(
       this.topology.services.map(async (service) => {
-        const url = `http://127.0.0.1:${service.port}`;
-        const res = await this.peers.serviceInfo(url);
-        return { name: service.name, reachable: res.ok, versions: res.versions, error: res.error };
+        const instances: ServiceInstanceView[] = await Promise.all(
+          instancesOf(this.topology, service.name).map(async (instance) => {
+            const url = instanceUrl(this.topology, service.name, instance.name);
+            const res = await this.peers.serviceInfo(url);
+            return {
+              name: instance.name,
+              port: instance.port,
+              reachable: res.ok,
+              versions: res.versions,
+              error: res.error,
+            };
+          }),
+        );
+        const reachable = instances.filter((instance) => instance.reachable);
+        const versions = new Set<Version>();
+        for (const instance of reachable) {
+          for (const version of instance.versions) versions.add(version);
+        }
+        return {
+          name: service.name,
+          reachable: reachable.length > 0,
+          versions: [...versions].sort(),
+          instances,
+          error:
+            reachable.length === 0
+              ? `no instance reachable (${instances.length} declared)`
+              : undefined,
+        };
       }),
     );
   }
@@ -972,10 +1056,12 @@ export class ReleaseController {
         name: `entry:${entry.name}`,
         url: `http://127.0.0.1:${entry.port}`,
       })),
-      ...this.topology.services.map((service) => ({
-        name: `service:${service.name}`,
-        url: `http://127.0.0.1:${service.port}`,
-      })),
+      ...this.topology.services.flatMap((service) =>
+        instancesOf(this.topology, service.name).map((instance) => ({
+          name: `service:${instance.name}`,
+          url: instanceUrl(this.topology, service.name, instance.name),
+        })),
+      ),
     ];
     await Promise.all(
       squeezes.map(async ({ name, url }) => {

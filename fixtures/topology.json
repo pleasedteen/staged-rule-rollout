@@ -6,18 +6,53 @@
     { "name": "entry-c", "port": 7403, "groups": ["currency", "report", "archive"] }
   ],
   "services": [
-    { "name": "ingest",           "port": 7410, "groups": ["currency"] },
-    { "name": "fx-math",          "port": 7411, "groups": ["currency"] },
-    { "name": "fx-tag",           "port": 7412, "groups": ["currency"] },
-    { "name": "fx-final",         "port": 7413, "groups": ["currency"] },
-    { "name": "search-index",     "port": 7414, "groups": ["search"] },
-    { "name": "search-a",         "port": 7415, "groups": ["search"] },
-    { "name": "search-b",         "port": 7416, "groups": ["search"] },
-    { "name": "search-final",     "port": 7417, "groups": ["search"] },
-    { "name": "report-aggregate", "port": 7418, "groups": ["report"] },
-    { "name": "report-format",    "port": 7419, "groups": ["report"] },
-    { "name": "report-final",     "port": 7420, "groups": ["report"] },
-    { "name": "archive-load",     "port": 7421, "groups": ["archive"] },
-    { "name": "archive-store",    "port": 7422, "groups": ["archive"] }
+    {
+      "name": "ingest",
+      "groups": ["currency"],
+      "instances": [
+        { "name": "ingest-1", "port": 7410 },
+        { "name": "ingest-2", "port": 7430 }
+      ]
+    },
+    {
+      "name": "fx-math",
+      "groups": ["currency"],
+      "instances": [
+        { "name": "fx-math-1", "port": 7411 },
+        { "name": "fx-math-2", "port": 7431 }
+      ]
+    },
+    {
+      "name": "fx-tag",
+      "groups": ["currency"],
+      "instances": [
+        { "name": "fx-tag-1", "port": 7412 },
+        { "name": "fx-tag-2", "port": 7432 }
+      ]
+    },
+    {
+      "name": "fx-final",
+      "groups": ["currency"],
+      "instances": [
+        { "name": "fx-final-1", "port": 7413 },
+        { "name": "fx-final-2", "port": 7433 }
+      ]
+    },
+    { "name": "search-index", "groups": ["search"], "instances": [{ "name": "search-index-1", "port": 7414 }] },
+    {
+      "name": "search-a",
+      "groups": ["search"],
+      "instances": [
+        { "name": "search-a-1", "port": 7415 },
+        { "name": "search-a-2", "port": 7435 }
+      ]
+    },
+    { "name": "search-b", "groups": ["search"], "instances": [{ "name": "search-b-1", "port": 7416 }] },
+    { "name": "search-final", "groups": ["search"], "instances": [{ "name": "search-final-1", "port": 7417 }] },
+    { "name": "report-aggregate", "groups": ["report"], "instances": [{ "name": "report-aggregate-1", "port": 7418 }] },
+    { "name": "report-format", "groups": ["report"], "instances": [{ "name": "report-format-1", "port": 7419 }] },
+    { "name": "report-final", "groups": ["report"], "instances": [{ "name": "report-final-1", "port": 7420 }] },
+    { "name": "archive-load", "groups": ["archive"], "instances": [{ "name": "archive-load-1", "port": 7421 }] },
+    { "name": "archive-store", "groups": ["archive"], "instances": [{ "name": "archive-store-1", "port": 7422 }] }
   ]
 }

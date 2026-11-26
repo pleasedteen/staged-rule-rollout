@@ -10,11 +10,29 @@ export type GroupId = string;
 export type ServiceName = string;
 export type Version = string;
 
+/**
+ * One runnable instance of a service. Rules and routes are still configured by
+ * service name; an instance is just a process that can execute that service's
+ * rules. Several instances of one service may be started and stopped
+ * independently.
+ */
+export interface ServiceInstanceDef {
+  name: string;
+  port: number;
+}
+
 export interface ServiceProcessDef {
   name: ServiceName;
-  port: number;
+  /**
+   * Legacy single-instance definition. When `instances` is absent this port
+   * describes the one and only instance (its instance name is the service
+   * name), so older topologies keep working unchanged.
+   */
+  port?: number;
   /** Informational: groups whose routes reference this service. */
   groups: GroupId[];
+  /** Independently startable instances; at least one is required. */
+  instances?: ServiceInstanceDef[];
 }
 
 export interface EntryProcessDef {
@@ -165,6 +183,7 @@ export interface ConfigDocument {
 
 export interface SegmentResult {
   service: ServiceName;
+  /** Instance that actually answered this segment. */
   instance: string;
   /** Version actually used by this segment; must equal the pinned version. */
   version: Version;
@@ -173,8 +192,18 @@ export interface SegmentResult {
   input: unknown;
   output: unknown;
   ms: number;
-  /** True when the segment needed a transport retry (e.g. service restart). */
+  /** True when the segment needed a transport retry (e.g. instance stopped). */
   recovered: boolean;
+  /**
+   * True when the output came from an already-durable journal entry rather
+   * than being recomputed for this call (e.g. the instance that computed it
+   * died before its acknowledgement reached the entry).
+   */
+  reused?: boolean;
+  /** Instance that originally persisted the reused result. */
+  originInstance?: string;
+  /** Number of other instances tried before this one answered. */
+  failovers?: number;
 }
 
 export type RequestStatus = 'accepted' | 'running' | 'done' | 'failed';
@@ -242,11 +271,16 @@ export interface RequestLedgerEntry {
 export interface ExecuteResponse {
   ok: boolean;
   service: ServiceName;
+  /** Instance that answered. */
   instance: string;
   version: Version;
   output?: unknown;
   ms: number;
   recovered: boolean;
+  /** Output was served from the durable journal instead of recomputed. */
+  cached?: boolean;
+  /** Instance that owns the journaled result (may differ from `instance`). */
+  originInstance?: string;
   error?: string;
   code?: string;
 }
@@ -286,10 +320,21 @@ export interface EntryBindingView {
   error?: string;
 }
 
-export interface ServiceReadinessView {
+export interface ServiceInstanceView {
   name: string;
+  port: number;
   reachable: boolean;
   versions: Version[];
+  error?: string;
+}
+
+export interface ServiceReadinessView {
+  name: string;
+  /** True when at least one instance is reachable. */
+  reachable: boolean;
+  /** Union of versions installed on reachable instances. */
+  versions: Version[];
+  instances: ServiceInstanceView[];
   error?: string;
 }
 

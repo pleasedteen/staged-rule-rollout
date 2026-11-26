@@ -29,10 +29,11 @@ import { joinValues, routePath, RuleError } from '../shared/engine';
 import {
   coordinatorUrl,
   fatal,
+  instanceUrl,
+  instancesOf,
   loadTopology,
   logEvent,
   parseArgs,
-  serviceUrl,
 } from '../shared/runtime';
 import { newId, sleep } from '../shared/util';
 
@@ -94,6 +95,11 @@ class EntryGateway {
   private active = new Set<Promise<void>>();
   /** Requests this process is currently executing (for graceful drain). */
   private running = new Map<string, RequestRecord>();
+  /**
+   * Last instance that answered per service. Routing stays sticky to the live
+   * instance and rotates only when that instance stops answering.
+   */
+  private readonly instanceCursor = new Map<ServiceName, number>();
   private syncTimer?: NodeJS.Timeout;
   private syncing = false;
   private initialized = false;
@@ -273,12 +279,17 @@ class EntryGateway {
   }
 
   /**
-   * Call one service with retry. Transport failures and version-not-installed
-   * errors are retried (a restarting service needs a moment); rule type errors
-   * are permanent and bubble up.
+   * Call one service with failover across its instances.
    *
-   * The retry carries the *same* pinned version and the same slot key, so the
-   * service's journal resumes rather than recomputing from scratch.
+   * The same pinned version, slot and input travel to every attempt. If the
+   * chosen instance is stopped mid-flight the next attempt goes to a sibling
+   * instance instead of waiting for the dead one to return. Instances of a
+   * service share their journal, so if an instance persisted the result and
+   * then died before acknowledging, the sibling answers with that exact
+   * result (`cached`, `reused`) and the route continues without redoing it.
+   *
+   * Transport failures and version-not-installed errors are retried; rule type
+   * errors are permanent and bubble up.
    */
   private async callService(
     service: ServiceName,
@@ -286,18 +297,36 @@ class EntryGateway {
     input: unknown,
     record: RequestRecord,
   ): Promise<SegmentResult> {
-    const url = serviceUrl(this.topology, service);
+    const instances = instancesOf(this.topology, service);
+    if (instances.length === 0) {
+      throw new RuleError(`service ${service} has no instances in the topology`, 'no_instances', {
+        service,
+      });
+    }
     const startedAt = Date.now();
     let recovered = false;
     let lastError: { error: string; code?: string; installed?: Version[] } | undefined;
+    // Rotate the starting instance per attempt so a stopped instance costs one
+    // quick failed attempt, then the rest of the retries spread over the
+    // survivors rather than hammering the same dead port.
+    const preferred = this.instanceCursor.get(service) ?? 0;
+    const order = Array.from(
+      { length: instances.length },
+      (_, offset) => instances[(preferred + offset) % instances.length],
+    );
+    let attempted = 0;
 
     for (let attempt = 0; attempt < 40; attempt += 1) {
+      const target = order[attempt % order.length];
+      const url = instanceUrl(this.topology, service, target.name);
       const res = await jsonRequest<{
         ok: boolean;
         output?: unknown;
         ms?: number;
         version?: Version;
         instance?: string;
+        cached?: boolean;
+        originInstance?: string;
         error?: string;
         code?: string;
         installed?: Version[];
@@ -314,11 +343,14 @@ class EntryGateway {
       });
 
       if (res.ok && res.body?.ok) {
+        // Prefer this instance next time for the same service.
+        this.instanceCursor.set(service, instances.indexOf(target));
         this.transport.requests += 1;
         this.transport.requestBytes += res.bytesOut;
+        if (res.body.cached) recovered = true;
         return {
           service,
-          instance: res.body.instance ?? service,
+          instance: res.body.instance ?? target.name,
           version: res.body.version ?? record.version,
           group: record.group,
           slot,
@@ -326,6 +358,9 @@ class EntryGateway {
           output: res.body.output,
           ms: res.body.ms ?? Date.now() - startedAt,
           recovered,
+          reused: Boolean(res.body.cached),
+          originInstance: res.body.originInstance,
+          failovers: attempted,
         };
       }
 
@@ -337,16 +372,16 @@ class EntryGateway {
       };
       if (body?.code === 'version_not_installed' && body.installed) {
         // Ask the coordinator for the doc and push it directly; the push path
-        // is idempotent and keeps the service's journal key stable.
+        // is idempotent and keeps the service's journal key stable. Push to
+        // this instance only — siblings receive their own config.
         const installed = await this.ensureServiceVersion(url);
         if (installed) {
           recovered = true;
           continue;
         }
       }
-      if (lastError.code === 'wrong_input_type' || lastError.code === 'bad_rule') {
-        break;
-      }
+      if (lastError.code === 'wrong_input_type' || lastError.code === 'bad_rule') break;
+      attempted += 1;
       recovered = true;
       await sleep(Math.min(40 + attempt * 20, 400));
     }
@@ -354,7 +389,7 @@ class EntryGateway {
     throw new RuleError(
       `segment ${service}@${slot} failed after retries: ${lastError?.error ?? 'unknown'}`,
       lastError?.code ?? 'segment_failed',
-      { service, slot, installed: lastError?.installed },
+      { service, slot, instances: instances.map((instance) => instance.name), installed: lastError?.installed },
       false,
     );
   }

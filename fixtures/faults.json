@@ -6,11 +6,21 @@
       "steps": [
         "POST /ops/advance            -> batch 1 (currency) effective",
         "POST /ops/pause",
-        "stop service report-format   (only batch 3 needs it)",
+        "stop instance archive-store-1 (only batch 3 needs it)",
         "POST /ops/advance            -> 409 paused (no silent advance while paused)",
         "POST /ops/resume",
-        "POST /ops/advance            -> batch 2 (search) effective despite report-format down",
-        "start service report-format"
+        "POST /ops/advance            -> batch 2 (search) effective despite archive-store being down",
+        "start instance archive-store-1"
+      ]
+    },
+    {
+      "name": "instance-level-readiness",
+      "steps": [
+        "stop instance fx-math-1 (fx-math still has fx-math-2)",
+        "POST /ops/advance            -> batch 1 effective; blocked list empty",
+        "stop the last remaining instance of a batch's service",
+        "POST /ops/advance            -> 409 blocked naming only that service",
+        "start the instance again"
       ]
     },
     {
@@ -40,11 +50,30 @@
       ]
     },
     {
+      "name": "instance-failover-inflight",
+      "steps": [
+        "POST /submit (currency)      -> entry pins to one fx-tag instance",
+        "POST /accept (currency) x N  -> requests enter the delayed fx-tag segment",
+        "kill -9 <that fx-tag instance>",
+        "GET /requests/:id            -> requests finish on the sibling instance, pinned version, recovered=true"
+      ]
+    },
+    {
+      "name": "lost-receipt-cross-instance-reuse",
+      "steps": [
+        "POST <fx-tag instance>/admin/fault {mode:'crash-after-journal'}",
+        "POST /accept (currency)      -> branch segment is durably written, then the instance exits before replying",
+        "entry retries on the sibling instance",
+        "GET /requests/:id            -> fx-tag segment has reused=true, originInstance=<dead instance>,",
+        "                               output equals the pinned-version oracle; join and fx-final still run on v2"
+      ]
+    },
+    {
       "name": "service-restart-recovery",
       "steps": [
         "POST /accept (currency)      -> request enters a delayed segment",
-        "kill -9 <service>",
-        "start <service>              -> boot heals journaled pending units",
+        "kill -9 <service instance>",
+        "start <service instance>     -> boot heals journaled pending units it owns",
         "GET /requests/:id            -> result matches the version pinned at acceptance"
       ]
     },
@@ -55,6 +84,14 @@
         "kill -9 entry-a",
         "POST entry-b /retry {requestId} -> resumes from the shared ledger with the pinned version",
         "GET entry-b /requests/:id    -> correct result, retries >= 1"
+      ]
+    },
+    {
+      "name": "single-instance-deployment",
+      "steps": [
+        "use fixtures/topology-single.json (only `port`, no `instances`)",
+        "start coordinator + one entry + services (no --instance flag needed)",
+        "POST /submit {group:'currency',input:5} -> done on v1 with the correct oracle result"
       ]
     }
   ]

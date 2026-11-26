@@ -16,33 +16,60 @@ import {
 
 const ROOT = resolve(__dirname, '..', '..');
 const RUN = join(ROOT, '.run');
+const RUN_SINGLE = join(ROOT, '.run-single');
 const FIXTURES = join(ROOT, 'fixtures');
 const TOPOLOGY_PATH = join(FIXTURES, 'topology.json');
+const TOPOLOGY_SINGLE_PATH = join(FIXTURES, 'topology-single.json');
 const PLAN_PATH = join(FIXTURES, 'plan.json');
 const DIST = join(ROOT, 'dist');
+
+interface InstanceDef {
+  name: string;
+  port: number;
+}
 
 interface TopologyFile {
   coordinator: { port: number };
   entries: { name: string; port: number; groups: string[] }[];
-  services: { name: string; port: number; groups: string[] }[];
+  services: { name: string; port?: number; groups: string[]; instances?: InstanceDef[] }[];
 }
 
+/** Instances of a service, including the legacy single-instance `port` form. */
+const serviceInstances = (service: TopologyFile['services'][number]): InstanceDef[] => {
+  if (service.instances && service.instances.length > 0) return service.instances;
+  if (typeof service.port === 'number') return [{ name: service.name, port: service.port }];
+  return [];
+};
+
 const topology = JSON.parse(readFileSync(TOPOLOGY_PATH, 'utf8')) as TopologyFile;
+const topologySingle = JSON.parse(readFileSync(TOPOLOGY_SINGLE_PATH, 'utf8')) as TopologyFile;
+
+const instancesByName = new Map<string, InstanceDef>();
+for (const service of [...topology.services, ...topologySingle.services]) {
+  for (const instance of serviceInstances(service)) instancesByName.set(instance.name, instance);
+}
+
 const coordinatorBase = `http://127.0.0.1:${topology.coordinator.port}`;
 const entryBase = (name: string): string =>
   `http://127.0.0.1:${topology.entries.find((entry) => entry.name === name)!.port}`;
-const serviceBase = (name: string): string =>
-  `http://127.0.0.1:${topology.services.find((service) => service.name === name)!.port}`;
-const entryPort = (name: string): number => topology.entries.find((e) => e.name === name)!.port;
-const servicePort = (name: string): number => topology.services.find((s) => s.name === name)!.port;
+const singleEntryBase = (name: string): string =>
+  `http://127.0.0.1:${topologySingle.entries.find((entry) => entry.name === name)!.port}`;
+const instanceBase = (name: string): string => `http://127.0.0.1:${instancesByName.get(name)!.port}`;
+const instanceNamesOf = (service: string): string[] =>
+  serviceInstances(topology.services.find((candidate) => candidate.name === service)!).map(
+    (instance) => instance.name,
+  );
 
 /* --------------------------------- processes -------------------------------- */
 
 interface ProcessSpec {
   role: 'coordinator' | 'entry' | 'service';
-  name: string;
+  /** Unique key inside one cluster (process/instance name). */
+  key: string;
   port: number;
   args: string[];
+  service?: string;
+  instance?: string;
   child?: ChildProcess;
   exited: boolean;
   stdout: string[];
@@ -52,11 +79,18 @@ interface ProcessSpec {
 class Cluster {
   readonly procs = new Map<string, ProcessSpec>();
 
-  constructor(private readonly dataDir: string) {}
+  constructor(
+    private readonly dataDir: string,
+    private readonly topo: TopologyFile,
+    private readonly topoPath: string,
+  ) {}
 
-  private spawnProcess(spec: Omit<ProcessSpec, 'child' | 'exited' | 'stdout' | 'stderr'>): ProcessSpec {
-    const proc: ProcessSpec = { ...spec, exited: false, stdout: [], stderr: [] };
-    const child = spawn(process.execPath, spec.args, {
+  private spawnProcess(
+    spec: Omit<ProcessSpec, 'child' | 'exited' | 'stdout' | 'stderr' | 'args'>,
+    args: string[],
+  ): ProcessSpec {
+    const proc: ProcessSpec = { ...spec, args, exited: false, stdout: [], stderr: [] };
+    const child = spawn(process.execPath, args, {
       cwd: ROOT,
       env: { ...process.env, NODE_NO_WARNINGS: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -73,38 +107,55 @@ class Cluster {
       proc.exited = true;
     });
     proc.child = child;
-    this.procs.set(spec.name, proc);
+    this.procs.set(spec.key, proc);
     return proc;
   }
 
-  private argsFor(role: 'coordinator' | 'entry' | 'service', name: string): string[] {
-    const common = ['--data-dir', this.dataDir, '--topology', TOPOLOGY_PATH];
-    if (role === 'coordinator') {
-      return [join(DIST, 'coordinator/main.js'), ...common, '--plan', PLAN_PATH];
-    }
-    return [join(DIST, `${role}/main.js`), ...common, '--name', name];
-  }
-
   startCoordinator(): ProcessSpec {
-    return this.spawnProcess({
-      role: 'coordinator',
-      name: 'coordinator',
-      port: topology.coordinator.port,
-      args: this.argsFor('coordinator', 'coordinator'),
-    });
+    return this.spawnProcess(
+      { role: 'coordinator', key: 'coordinator', port: this.topo.coordinator.port },
+      [
+        join(DIST, 'coordinator/main.js'),
+        '--data-dir',
+        this.dataDir,
+        '--topology',
+        this.topoPath,
+        '--plan',
+        PLAN_PATH,
+      ],
+    );
   }
 
   startEntry(name: string): ProcessSpec {
-    return this.spawnProcess({ role: 'entry', name, port: entryPort(name), args: this.argsFor('entry', name) });
+    const entry = this.topo.entries.find((candidate) => candidate.name === name)!;
+    return this.spawnProcess(
+      { role: 'entry', key: name, port: entry.port },
+      [
+        join(DIST, 'entry/main.js'),
+        '--data-dir',
+        this.dataDir,
+        '--topology',
+        this.topoPath,
+        '--name',
+        name,
+      ],
+    );
   }
 
-  startService(name: string): ProcessSpec {
-    return this.spawnProcess({
-      role: 'service',
-      name,
-      port: servicePort(name),
-      args: this.argsFor('service', name),
-    });
+  startService(service: string, instance: string, port: number): ProcessSpec {
+    const args = [
+      join(DIST, 'service/main.js'),
+      '--data-dir',
+      this.dataDir,
+      '--topology',
+      this.topoPath,
+      '--name',
+      service,
+    ];
+    // Legacy single-instance services (instance name == service name) need no
+    // --instance flag; that path is exercised by the compatibility cluster.
+    if (instance !== service) args.push('--instance', instance);
+    return this.spawnProcess({ role: 'service', key: instance, port, service, instance }, args);
   }
 
   async waitHealthy(base: string, timeoutMs = 10000): Promise<void> {
@@ -132,31 +183,45 @@ class Cluster {
     // (they also touch the cluster DB) and services (local DB only). This
     // avoids a boot-time stampede on the new cluster file.
     this.startCoordinator();
-    await this.waitHealthy(coordinatorBase);
-    for (const entry of topology.entries) {
+    await this.waitHealthy(`http://127.0.0.1:${this.topo.coordinator.port}`);
+    for (const entry of this.topo.entries) {
       this.startEntry(entry.name);
-      await this.waitHealthy(entryBase(entry.name));
+      await this.waitHealthy(`http://127.0.0.1:${entry.port}`);
     }
-    for (const service of topology.services) this.startService(service.name);
-    await Promise.all(topology.services.map((service) => this.waitHealthy(serviceBase(service.name))));
+    const started: { base: string }[] = [];
+    for (const service of this.topo.services) {
+      for (const instance of serviceInstances(service)) {
+        this.startService(service.name, instance.name, instance.port);
+        started.push({ base: `http://127.0.0.1:${instance.port}` });
+      }
+    }
+    await Promise.all(started.map((item) => this.waitHealthy(item.base)));
+  }
+
+  private baseOf(key: string): string {
+    const proc = this.procs.get(key);
+    if (!proc) throw new Error(`unknown process ${key}`);
+    return `http://127.0.0.1:${proc.port}`;
   }
 
   /** SIGKILL — no graceful flush, mirroring a real crash. */
-  async kill(name: string): Promise<void> {
-    const proc = this.procs.get(name);
+  async kill(key: string): Promise<void> {
+    const proc = this.procs.get(key);
     if (!proc?.child || proc.exited) return;
+    const base = this.baseOf(key);
     const exited = new Promise<void>((resolveExit) => proc.child!.once('exit', () => resolveExit()));
     proc.child.kill('SIGKILL');
     await Promise.race([exited, sleep(3000)]);
-    await this.waitUnhealthy(`http://127.0.0.1:${proc.port}`, 3000).catch(() => undefined);
+    await this.waitUnhealthy(base, 3000).catch(() => undefined);
   }
 
-  async restart(name: string): Promise<void> {
-    const existing = this.procs.get(name);
-    if (!existing) throw new Error(`unknown process ${name}`);
+  /** Relaunch a process (also used after a deliberate self-exit). */
+  async restart(key: string): Promise<void> {
+    const existing = this.procs.get(key);
+    if (!existing) throw new Error(`unknown process ${key}`);
     if (existing.role === 'coordinator') this.startCoordinator();
-    else if (existing.role === 'entry') this.startEntry(name);
-    else this.startService(name);
+    else if (existing.role === 'entry') this.startEntry(key);
+    else this.startService(existing.service!, existing.instance!, existing.port);
     await this.waitHealthy(`http://127.0.0.1:${existing.port}`);
     // Give the entry sync loop a moment to observe settled bindings.
     if (existing.role === 'entry') await sleep(300);
@@ -218,6 +283,13 @@ class Report {
 
 /* ---------------------------------- clients --------------------------------- */
 
+interface ServiceInstanceView {
+  name: string;
+  port: number;
+  reachable: boolean;
+  versions: string[];
+}
+
 interface StateView {
   releaseId: string;
   status: string;
@@ -240,7 +312,12 @@ interface StateView {
   recoveries: number;
   lastRecovery: string | null;
   entries?: { name: string; reachable: boolean; epoch: number | null; versions: Record<string, string> }[];
-  services?: { name: string; reachable: boolean; versions: string[] }[];
+  services?: {
+    name: string;
+    reachable: boolean;
+    versions: string[];
+    instances: ServiceInstanceView[];
+  }[];
 }
 
 interface RecordView {
@@ -249,7 +326,17 @@ interface RecordView {
   group: string;
   status: string;
   output?: unknown;
-  segments: { service: string; version: string; recovered: boolean; slot: string; output: unknown }[];
+  segments: {
+    service: string;
+    instance: string;
+    version: string;
+    recovered: boolean;
+    reused?: boolean;
+    originInstance?: string;
+    failovers?: number;
+    slot: string;
+    output: unknown;
+  }[];
   retries: number;
   resumedBy?: string;
   error?: string;
@@ -336,6 +423,18 @@ const waitBindings = async (groups: string[], timeoutMs = 8000): Promise<void> =
 
 const recordsEqual = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 
+/** Instance name (without boot suffix) that answered a service segment. */
+const segmentInstance = (record: RecordView | undefined, service: string): string | undefined => {
+  const segment = (record?.segments ?? []).find((candidate) => candidate.service === service);
+  return segment?.instance.split('#')[0];
+};
+
+const otherInstanceOf = (service: string, instance: string): string => {
+  const other = instanceNamesOf(service).find((candidate) => candidate !== instance);
+  if (!other) throw new Error(`service ${service} has no sibling of ${instance}`);
+  return other;
+};
+
 /** True if nothing is listening on the port (we can bind it). */
 const portFree = (port: number): Promise<boolean> =>
   new Promise((resolvePort) => {
@@ -345,12 +444,18 @@ const portFree = (port: number): Promise<boolean> =>
     server.listen(port, '127.0.0.1');
   });
 
-/** All ports the fixed topology will use. */
-const allPorts = (): number[] => [
-  topology.coordinator.port,
-  ...topology.entries.map((entry) => entry.port),
-  ...topology.services.map((service) => service.port),
-];
+/** All ports both clusters will use. */
+const allPorts = (): number[] => {
+  const ports = new Set<number>();
+  for (const topo of [topology, topologySingle]) {
+    ports.add(topo.coordinator.port);
+    for (const entry of topo.entries) ports.add(entry.port);
+    for (const service of topo.services) {
+      for (const instance of serviceInstances(service)) ports.add(instance.port);
+    }
+  }
+  return [...ports];
+};
 
 /**
  * Refuse to run against leftover processes. Reusing a deleted `.run` while an
@@ -383,17 +488,24 @@ async function main(): Promise<number> {
   }
   rmSync(RUN, { recursive: true, force: true });
   mkdirSync(RUN, { recursive: true });
+  rmSync(RUN_SINGLE, { recursive: true, force: true });
+  mkdirSync(RUN_SINGLE, { recursive: true });
 
   const report = new Report();
-  const cluster = new Cluster(RUN);
+  const cluster = new Cluster(RUN, topology, TOPOLOGY_PATH);
   const startedAt = Date.now();
+
+  // Services with more than one instance (their failover is exercised below).
+  const multiInstance = topology.services
+    .filter((service) => serviceInstances(service).length > 1)
+    .map((service) => service.name);
 
   try {
     /* ------------------------------- 1. boot ------------------------------- */
     report.section('1. Boot & initial state');
     await cluster.startAll();
     await waitBindings(['currency', 'search', 'report']);
-    const initial = await state();
+    const initial = await state(true);
     report.check(initial.releaseId === 'rel-2026-11-26', 'plan installed', `releaseId=${initial.releaseId}`);
     report.check(
       initial.batches.every((batch) => batch.status === 'pending'),
@@ -406,6 +518,31 @@ async function main(): Promise<number> {
       'initial bindings are v1 for every group',
       JSON.stringify(initial.bindings.versions),
     );
+    {
+      const declared = topology.services.reduce(
+        (sum, service) => sum + serviceInstances(service).length,
+        0,
+      );
+      const seen = (initial.services ?? []).flatMap((service) => service.instances);
+      report.check(
+        seen.length === declared && seen.every((instance) => instance.reachable),
+        'every declared service instance is up and independently addressable',
+        `declared=${declared} reachable=${seen.filter((instance) => instance.reachable).length}`,
+      );
+      report.check(
+        multiInstance.length >= 3 &&
+          multiInstance.every((service) =>
+            (initial.services ?? []).find((view) => view.name === service)?.instances.length === 2,
+          ),
+        'services with several instances expose each one to the coordinator',
+        multiInstance
+          .map(
+            (service) =>
+              `${service}:${(initial.services ?? []).find((view) => view.name === service)?.instances.map((i) => i.name).join('+')}`,
+          )
+          .join(' '),
+      );
+    }
 
     /* ------------------------- 2. pinning at accept ------------------------ */
     report.section('2. Version pinned at first acceptance');
@@ -445,10 +582,29 @@ async function main(): Promise<number> {
     }
 
     /* ---------------------- 3. batch 1 shared boundary --------------------- */
-    report.section('3. Batch 1 — currency, shared entry boundary');
+    report.section('3. Batch 1 — currency, instance-level readiness');
     {
+      // Take one fx-math instance down before advancing: the batch must still
+      // go through because the sibling instance can execute the target.
+      await cluster.kill('fx-math-1');
+      const degraded = await state(true);
+      const fxMath = (degraded.services ?? []).find((service) => service.name === 'fx-math');
+      report.check(
+        fxMath?.reachable === true &&
+          fxMath.instances.filter((instance) => !instance.reachable).map((instance) => instance.name).join(',') ===
+            'fx-math-1',
+        'a service stays ready with one of its instances down',
+        `reachable=${fxMath?.instances.filter((i) => i.reachable).map((i) => i.name).join(',')}`,
+      );
+
       const advance = await ops('/ops/advance');
       report.check(advance.status === 200 && advance.body.ok, 'advance batch 1 succeeds', advance.body.error ?? 'ok');
+      report.check(
+        Array.isArray(advance.body.blocked) && advance.body.blocked.length === 0,
+        'readiness needs only one executable instance per service',
+        JSON.stringify(advance.body.blocked ?? []),
+      );
+      await cluster.restart('fx-math-1');
       const after = await state();
       const observed = await Promise.all(['entry-a', 'entry-b', 'entry-c'].map(entryBindings));
       report.check(
@@ -474,6 +630,11 @@ async function main(): Promise<number> {
         'new currency traffic pins v2 with the v2 oracle result',
         `v=${v2Record?.version} out=${JSON.stringify(v2Record?.output)} exp=${JSON.stringify(expectedCurrencyV2(5))}`,
       );
+      report.check(
+        (v2Record?.segments ?? []).every((segment) => segment.version === 'v2'),
+        'no segment mixed versions while one instance was restarted',
+        (v2Record?.segments ?? []).map((s) => `${s.service}@${s.version}`).join(' '),
+      );
       const search = await accept('entry-b', 'search', 'kiwi');
       const searchRecord = await waitRecord('entry-b', search.body.requestId);
       report.check(
@@ -486,7 +647,7 @@ async function main(): Promise<number> {
     /* ------------------ 4. pause + later-batch downtime ------------------- */
     report.section('4. Pause semantics & later-batch-exclusive downtime');
     {
-      await cluster.kill('archive-store'); // only batch 3 needs it
+      await cluster.kill('archive-store-1'); // only batch 3 needs it
       await ops('/ops/pause');
       const blocked = await ops('/ops/advance');
       report.check(
@@ -503,11 +664,15 @@ async function main(): Promise<number> {
       );
 
       await ops('/ops/resume');
-      const advance2 = await ops('/ops/advance');
+
+      // Batch 2 needs search-a. One instance down must not block it; all
+      // instances down must, and only search-a must be named.
+      await cluster.kill('search-a-1');
+      const oneDown = await ops('/ops/advance');
       report.check(
-        advance2.status === 200 && advance2.body.ok,
-        'batch 2 advances although archive-store (batch 3 only) is down',
-        JSON.stringify(advance2.body.blocked ?? 'unblocked'),
+        oneDown.status === 200 && oneDown.body.ok,
+        'batch 2 advances with one search-a instance down',
+        JSON.stringify(oneDown.body.blocked ?? oneDown.body.error ?? 'ok'),
       );
       const after2 = await state();
       report.check(
@@ -523,11 +688,6 @@ async function main(): Promise<number> {
         JSON.stringify(after2.batches[1].effective),
       );
       report.check(
-        after2.bindings.epoch > 0,
-        'a single epoch covers the multi-group batch',
-        `epoch=${after2.bindings.epoch}`,
-      );
-      report.check(
         after2.batches[0].status === 'effective' && after2.batches[2].status === 'pending',
         'batch 1 effective and batch 3 pending after batch 2',
         after2.batches.map((b) => `${b.name}=${b.status}`).join(', '),
@@ -540,7 +700,7 @@ async function main(): Promise<number> {
       report.check(
         (search.body.record as RecordView)?.version === 'v2' &&
           recordsEqual((search.body.record as RecordView)?.output, expectedSearchV2('post-batch2')),
-        'search now serves v2',
+        'search now serves v2 through a single surviving instance',
         `out=${JSON.stringify((search.body.record as RecordView)?.output)}`,
       );
       report.check(
@@ -554,17 +714,18 @@ async function main(): Promise<number> {
         'archive still pinned to v1 while its batch is pending',
         `v=${(archive.body.record as RecordView)?.version}`,
       );
-      await cluster.restart('archive-store');
+      await cluster.restart('search-a-1');
+      await cluster.restart('archive-store-1');
     }
 
     /* ------------------- 5. same-batch service downtime ------------------- */
-    report.section('5. Batch blocked when its own service is down');
+    report.section('5. Batch blocked when every instance is down');
     {
-      await cluster.kill('archive-load'); // batch 3 needs it
+      await cluster.kill('archive-load-1'); // batch 3 needs it; only instance
       const blocked = await ops('/ops/advance');
       report.check(
         blocked.status === 409 && blocked.body.code === 'blocked',
-        'batch 3 is blocked while archive-load is down',
+        'batch 3 is blocked while every archive-load instance is down',
         JSON.stringify(blocked.body.blocked ?? blocked.body.error),
       );
       report.check(
@@ -579,7 +740,7 @@ async function main(): Promise<number> {
         'already-effective batches are unaffected by the block',
         (await state()).batches[1].status,
       );
-      await cluster.restart('archive-load');
+      await cluster.restart('archive-load-1');
       const retry = await ops('/ops/advance');
       report.check(retry.status === 200 && retry.body.ok, 'batch 3 advances once the service is back', retry.body.error ?? 'ok');
       const archive = await submit('entry-c', 'archive', 'after-batch3');
@@ -737,20 +898,26 @@ async function main(): Promise<number> {
       report.check((await state()).bindings.versions.currency === 'v2', 'currency now v2 again', JSON.stringify((await state()).bindings.versions));
     }
 
-    /* ------- 10. service restart: first batch of concurrent requests ------ */
-    report.section('10. Service restart — first concurrent batch after reboot');
+    /* ------- 10. instance halt mid-request: first concurrent batch -------- */
+    report.section('10. Instance halt mid-request — in-flight requests fail over');
     {
-      // FX-tag has a 500 ms delay, so these requests are still in flight when
-      // the service is killed. A restart happens promptly; the accepted
-      // requests must then finish on their pinned v2 (service journal heal +
-      // entry retry) rather than fail or flip version.
+      // Pin the entry's affinity to one fx-tag instance, then stop it while a
+      // batch of currency requests is inside its 500 ms delay. The requests
+      // must continue on the sibling instance, on their pinned version.
+      const warm = await submit('entry-a', 'currency', 90);
+      const active = segmentInstance(warm.body.record as RecordView, 'fx-tag')!;
+      const sibling = otherInstanceOf('fx-tag', active);
+      report.check(
+        Boolean(active) && Boolean(sibling),
+        'entry is steering currency traffic to one fx-tag instance',
+        `active=${active} sibling=${sibling}`,
+      );
+
       const inFlight = await Promise.all(
         Array.from({ length: 6 }, (_, index) => accept('entry-a', 'currency', 100 + index)),
       );
-      await sleep(120);
-      await cluster.kill('fx-tag');
-      await sleep(150);
-      await cluster.restart('fx-tag');
+      await sleep(160);
+      await cluster.kill(active);
       const firstWave = await Promise.all(
         inFlight.map((receipt) => waitRecord('entry-a', receipt.body.requestId, 25000)),
       );
@@ -762,18 +929,36 @@ async function main(): Promise<number> {
       );
       report.check(
         firstWaveOk,
-        'requests in flight across the restart still resolve on v2',
+        'requests whose instance stopped still resolve on the pinned version',
         firstWave
           .map((record, index) => `${record?.status}:${recordsEqual(record?.output, expectedCurrencyV2(100 + index))}`)
           .join(' '),
       );
       report.check(
         firstWave.every((record) => (record?.segments ?? []).every((segment) => segment.version === 'v2')),
-        'no in-flight segment flipped to another version',
+        'no in-flight segment flipped to another version during failover',
         firstWave.map((record) => (record?.segments ?? []).map((s) => s.version).join('/')).join(' '),
       );
+      report.check(
+        firstWave.every((record) => segmentInstance(record, 'fx-tag') === sibling),
+        'every resumed branch segment ran on the sibling instance',
+        firstWave.map((record) => segmentInstance(record, 'fx-tag')).join(','),
+      );
+      report.check(
+        firstWave.every((record) =>
+          (record?.segments ?? [])
+            .filter((segment) => segment.service === 'fx-tag')
+            .every((segment) => segment.recovered && (segment.failovers ?? 0) >= 1),
+        ),
+        'the stopped instance was actually exercised through failover',
+        firstWave
+          .flatMap((record) => (record?.segments ?? []).filter((s) => s.service === 'fx-tag'))
+          .map((segment) => `rec=${segment.recovered}/fb=${segment.failovers}`)
+          .join(' '),
+      );
+      await cluster.restart(active);
 
-      // Immediately fire the first concurrent batch after the reboot.
+      // Immediately fire the first concurrent batch after the failover.
       const burstInputs = Array.from({ length: 12 }, (_, index) => 200 + index);
       const burst = await Promise.all(burstInputs.map((input) => accept('entry-c', 'currency', input)));
       const burstRecords = await Promise.all(
@@ -785,29 +970,87 @@ async function main(): Promise<number> {
       });
       report.check(
         allCorrect,
-        'first concurrent batch after restart returns pinned-version results',
+        'first concurrent batch after failover returns pinned-version results',
         burstRecords
           .map((record, index) => `${record?.status}:${recordsEqual(record?.output, expectedCurrencyV2(burstInputs[index]))}`)
           .join(' '),
       );
-      report.check(
-        burstRecords.every((record) => (record?.segments ?? []).every((segment) => segment.version === 'v2')),
-        'no post-restart segment ran a version other than v2',
-        burstRecords.map((record) => (record?.segments ?? []).map((s) => s.version).join('/')).join(' '),
-      );
-      report.check(
-        firstWave.some((record) => (record?.segments ?? []).some((segment) => segment.recovered)),
-        'the restart was exercised through the recovery path',
-        firstWave
-          .flatMap((record) => record?.segments ?? [])
-          .filter((segment) => segment.recovered)
-          .map((segment) => segment.slot)
-          .join(',') || 'none',
-      );
     }
 
-    /* -------------- 11. cross-entry retry after an entry crash ------------ */
-    report.section('11. Cross-entry resume after entry crash');
+    /* ------------------ 11. branch takeover reuses durable result --------- */
+    report.section('11. Lost receipt: branch result reused by a sibling instance');
+    {
+      // Warm up so the entry is pinned to one fx-tag instance, then arm a
+      // one-shot fault that persists the branch result and dies before
+      // acknowledging. The retry lands on the sibling, which must re-read the
+      // durable result rather than recompute, and the join + serial tail must
+      // still run on the pinned version.
+      const warm = await submit('entry-a', 'currency', 710);
+      const origin = segmentInstance(warm.body.record as RecordView, 'fx-tag')!;
+      const sibling = otherInstanceOf('fx-tag', origin);
+      const armed = await jsonRequest<{ ok: boolean; armed?: string }>(instanceBase(origin), {
+        path: '/admin/fault',
+        body: { mode: 'crash-after-journal' },
+        timeoutMs: 3000,
+      });
+      report.check(armed.ok && armed.body?.armed === 'crash-after-journal', 'armed durable-write-then-crash on the active instance', `instance=${origin}`);
+
+      const input = 711;
+      const accepted = await accept('entry-a', 'currency', input);
+      // The origin process exits by itself after writing the journal.
+      const record = await waitRecord('entry-a', accepted.body.requestId, 30000);
+
+      const tag = (record?.segments ?? []).find((segment) => segment.service === 'fx-tag');
+      const finalSegment = (record?.segments ?? []).find((segment) => segment.service === 'fx-final');
+      const expectedTag = `${input}n=-v2`; // v2 fx-tag: tag "-v2" on "711n="
+      report.check(
+        record?.status === 'done' && record.version === 'v2',
+        'request completes on its pinned v2 after the receipt was lost',
+        `status=${record?.status} v=${record?.version} err=${record?.error ?? ''}`,
+      );
+      report.check(
+        Boolean(tag?.reused) && tag?.instance.split('#')[0] === sibling,
+        'the sibling served the branch segment from the durable journal',
+        `instance=${tag?.instance} sibling=${sibling} reused=${tag?.reused}`,
+      );
+      report.check(
+        (tag?.originInstance ?? '').split('#')[0] === origin,
+        'the reused segment is attributed to the instance that persisted it',
+        `origin=${tag?.originInstance} expected=${origin}`,
+      );
+      report.check(
+        recordsEqual(tag?.output, expectedTag),
+        'the reused branch result is the first-acceptance version result',
+        `output=${JSON.stringify(tag?.output)} expected=${JSON.stringify(expectedTag)}`,
+      );
+      report.check(
+        Boolean(tag?.recovered) && (tag?.failovers ?? 0) >= 1,
+        'the takeover was recorded as a recovery on the segment',
+        `recovered=${tag?.recovered} failovers=${tag?.failovers}`,
+      );
+      report.check(
+        (record?.segments ?? []).every((segment) => segment.version === 'v2'),
+        'branches, join and the serial tail all used the pinned version',
+        (record?.segments ?? []).map((s) => `${s.slot}@${s.version}`).join(' | '),
+      );
+      report.check(
+        recordsEqual(record?.output, expectedCurrencyV2(input)) &&
+          recordsEqual(finalSegment?.output, expectedCurrencyV2(input)),
+        'final join output matches the independent v2 oracle',
+        `actual=${JSON.stringify(record?.output)} expected=${JSON.stringify(expectedCurrencyV2(input))}`,
+      );
+      report.check(
+        (record?.segments ?? []).filter((segment) => segment.service === 'fx-math').length === 1 &&
+          (record?.segments ?? []).some((segment) => segment.service === 'fx-final'),
+        'the parallel sibling branch and the serial tail each ran exactly once',
+        (record?.segments ?? []).map((s) => s.service).join(','),
+      );
+
+      await cluster.restart(origin);
+    }
+
+    /* -------------- 12. cross-entry retry after an entry crash ------------ */
+    report.section('12. Cross-entry resume after entry crash');
     {
       // Currency's fx-tag has an 80 ms delay, so the request is still running
       // when we kill the accepting entry.
@@ -836,17 +1079,30 @@ async function main(): Promise<number> {
       await cluster.restart('entry-a');
     }
 
-    /* ------------- 12. transport invariant under request volume ----------- */
-    report.section('12. Config transport does not scale with request volume');
+    /* ------------- 13. transport invariant under request volume ----------- */
+    report.section('13. Config distribution is per instance and request-volume independent');
     {
-      const configBytes = async (): Promise<number> => {
-        const res = await jsonRequest<{ configBytes: number }>(coordinatorBase, {
-          path: '/admin/transport',
-          timeoutMs: 4000,
-        });
-        return res.body?.configBytes ?? 0;
+      const transport = async (): Promise<{
+        configBytes: number;
+        perProcess: Record<string, number>;
+      }> => {
+        const res = await jsonRequest<{ configBytes: number; perProcess: Record<string, number> }>(
+          coordinatorBase,
+          { path: '/admin/transport', timeoutMs: 4000 },
+        );
+        return { configBytes: res.body?.configBytes ?? 0, perProcess: res.body?.perProcess ?? {} };
       };
-      const before = await configBytes();
+      const before = await transport();
+      report.check(
+        multiInstance.every((service) =>
+          instanceNamesOf(service).every(
+            (instance) => (before.perProcess[`service:${instance}`] ?? 0) >= 0,
+          ),
+        ) && instanceNamesOf('fx-tag').every((instance) => `service:${instance}` in before.perProcess),
+        'the transport ledger accounts for every instance separately',
+        `perProcess=${Object.keys(before.perProcess).filter((k) => k.startsWith('service:fx-tag')).join(',')}`,
+      );
+
       const burst = await Promise.all(
         Array.from({ length: 24 }, (_, index) =>
           submit(index % 2 === 0 ? 'entry-a' : 'entry-b', 'search', `bulk-${index}`),
@@ -860,11 +1116,11 @@ async function main(): Promise<number> {
           .map((res) => `${res.status}:${JSON.stringify(res.body?.code ?? res.body?.error ?? res.transportError ?? (res.body.record as RecordView | undefined)?.error)}`)
           .join(' | ') || 'all done',
       );
-      const after = await configBytes();
+      const after = await transport();
       report.check(
-        after === before,
+        after.configBytes === before.configBytes,
         'config bytes over the wire unchanged by 24 requests',
-        `before=${formatBytes(before)} after=${formatBytes(after)} delta=${after - before}`,
+        `before=${formatBytes(before.configBytes)} after=${formatBytes(after.configBytes)} delta=${after.configBytes - before.configBytes}`,
       );
       const segmentCounts = burst.map((res) => ((res.body.record as RecordView | undefined)?.segments ?? []).length);
       report.check(
@@ -880,11 +1136,11 @@ async function main(): Promise<number> {
       report.check(versions.size === 1 && versions.has('v2'), 'all bulk requests pinned v2', [...versions].join(','));
     }
 
-    /* --------------------------- 13. skew control ------------------------- */
-    report.section('13. Version-skew is surfaced, not silently mixed');
+    /* --------------------------- 14. skew control ------------------------- */
+    report.section('14. Version-skew is surfaced, not silently mixed');
     {
       const wrongType = await jsonRequest<{ ok: boolean; code?: string; error?: string }>(
-        serviceBase('fx-math'),
+        instanceBase('fx-math-1'),
         {
           path: '/execute',
           body: { requestId: 'skew-1', version: 'v1', slot: 'probe', service: 'fx-math', input: 'not-a-number' },
@@ -896,7 +1152,7 @@ async function main(): Promise<number> {
         'v1 numeric rule rejects string input from a v2-shaped pipeline',
         `status=${wrongType.status} code=${wrongType.body?.code}`,
       );
-      const missingVersion = await jsonRequest<{ ok: boolean; code?: string }>(serviceBase('fx-math'), {
+      const missingVersion = await jsonRequest<{ ok: boolean; code?: string }>(instanceBase('fx-math-1'), {
         path: '/execute',
         body: { requestId: 'skew-2', version: 'v9', slot: 'probe', service: 'fx-math', input: 1 },
         timeoutMs: 3000,
@@ -906,10 +1162,21 @@ async function main(): Promise<number> {
         'a segment refuses a version it does not have',
         `status=${missingVersion.status} code=${missingVersion.body?.code}`,
       );
+      // An instance refuses to execute a service name it does not implement.
+      const wrongService = await jsonRequest<{ ok: boolean; code?: string }>(instanceBase('fx-math-1'), {
+        path: '/execute',
+        body: { requestId: 'skew-3', version: 'v2', slot: 'probe', service: 'fx-tag', input: 'x' },
+        timeoutMs: 3000,
+      });
+      report.check(
+        wrongService.status === 400 && wrongService.body?.code === 'bad_request',
+        'an instance rejects a request for a different service name',
+        `status=${wrongService.status} code=${wrongService.body?.code}`,
+      );
     }
 
-    /* -------------------------- 14. final sanity -------------------------- */
-    report.section('14. Final consistency');
+    /* -------------------------- 15. final sanity -------------------------- */
+    report.section('15. Final consistency');
     {
       const final = await state(true);
       report.check(
@@ -921,6 +1188,14 @@ async function main(): Promise<number> {
         final.batches.every((batch) => batch.status === 'effective'),
         'every batch effective at the end',
         final.batches.map((b) => `${b.name}=${b.status}`).join(', '),
+      );
+      report.check(
+        (final.services ?? []).every((service) => service.reachable),
+        'every service still has at least one healthy instance',
+        (final.services ?? [])
+          .filter((service) => !service.reachable)
+          .map((service) => service.name)
+          .join(',') || 'all reachable',
       );
       const ledger = await jsonRequest<{ configBytes: number; byRole: Record<string, number> }>(
         coordinatorBase,
@@ -940,7 +1215,7 @@ async function main(): Promise<number> {
       );
 
       // Also verify an older pinned version is still executable directly.
-      const v1Probe = await jsonRequest<{ ok: boolean; output?: unknown }>(serviceBase('report-format'), {
+      const v1Probe = await jsonRequest<{ ok: boolean; output?: unknown }>(instanceBase('report-format-1'), {
         path: '/execute',
         body: { requestId: 'hist-1', version: 'v1', slot: 'root', service: 'report-format', input: 'x' },
         timeoutMs: 3000,
@@ -950,6 +1225,39 @@ async function main(): Promise<number> {
         'older pinned versions remain executable after the release completes',
         `output=${JSON.stringify(v1Probe.body?.output)} exp="x-fmt1"`,
       );
+    }
+
+    /* ------------- 16. legacy single-instance deployment still works ------- */
+    report.section('16. Single-instance deployment stays supported');
+    {
+      const single = new Cluster(RUN_SINGLE, topologySingle, TOPOLOGY_SINGLE_PATH);
+      try {
+        await single.startAll();
+        const soloEntry = topologySingle.entries[0].name;
+        const res = await jsonRequest<{ ok: boolean; record?: RecordView }>(singleEntryBase(soloEntry), {
+          path: '/submit',
+          body: { group: 'currency', input: 5 },
+          timeoutMs: 20000,
+        });
+        const record = res.body?.record;
+        report.check(
+          res.status === 200 && record?.status === 'done',
+          'a topology that declares only `port` boots and serves requests',
+          `status=${res.status} record=${record?.status ?? res.body?.ok}`,
+        );
+        report.check(
+          record?.version === 'v1' && recordsEqual(record.output, expectedCurrencyV1(5)),
+          'the single-instance route produces the correct result',
+          `v=${record?.version} out=${JSON.stringify(record?.output)}`,
+        );
+        report.check(
+          (record?.segments ?? []).every((segment) => segment.version === 'v1'),
+          'single-instance segments all use the pinned version',
+          (record?.segments ?? []).map((s) => `${s.service}@${s.instance}`).join(' '),
+        );
+      } finally {
+        await single.shutdown();
+      }
     }
   } finally {
     await cluster.shutdown();

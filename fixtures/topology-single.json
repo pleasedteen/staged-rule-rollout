@@ -1,0 +1,21 @@
+{
+  "coordinator": { "port": 7500 },
+  "entries": [
+    { "name": "solo-entry", "port": 7501, "groups": ["currency", "search", "report", "archive"] }
+  ],
+  "services": [
+    { "name": "ingest",           "port": 7510, "groups": ["currency"] },
+    { "name": "fx-math",          "port": 7511, "groups": ["currency"] },
+    { "name": "fx-tag",           "port": 7512, "groups": ["currency"] },
+    { "name": "fx-final",         "port": 7513, "groups": ["currency"] },
+    { "name": "search-index",     "port": 7514, "groups": ["search"] },
+    { "name": "search-a",         "port": 7515, "groups": ["search"] },
+    { "name": "search-b",         "port": 7516, "groups": ["search"] },
+    { "name": "search-final",     "port": 7517, "groups": ["search"] },
+    { "name": "report-aggregate", "port": 7518, "groups": ["report"] },
+    { "name": "report-format",    "port": 7519, "groups": ["report"] },
+    { "name": "report-final",     "port": 7520, "groups": ["report"] },
+    { "name": "archive-load",     "port": 7521, "groups": ["archive"] },
+    { "name": "archive-store",    "port": 7522, "groups": ["archive"] }
+  ]
+}
