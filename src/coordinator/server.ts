@@ -127,7 +127,48 @@ export async function handleCoordinatorRequest(
       .split(',')
       .map((id) => id.trim())
       .filter(Boolean);
-    return { status: 200, body: { ok: true, records: await fanOutRecords(options.entryUrls, ids) } };
+    const remote = await fanOutRecords(options.entryUrls, ids);
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        records: controller.describeRecords(ids, remote),
+        // Kept for compatibility: the raw entry records, unfiltered.
+        entries: [...remote.values()],
+      },
+    };
+  }
+
+  if (path === '/admin/progress' && ctx.method === 'POST') {
+    const events = Array.isArray(ctx.body?.events) ? ctx.body.events : ctx.body?.event;
+    const result = controller.acceptProgress(events);
+    // A held stage must not be acknowledged: return a retryable status so the
+    // producer keeps those events in its durable outbox for later backfill.
+    return { status: result.held > 0 ? 503 : 200, body: result };
+  }
+
+  if (path === '/admin/progress/control' && ctx.method === 'GET') {
+    return { status: 200, body: { ok: true, ...controller.progressChannelStatus() } };
+  }
+
+  if (path === '/admin/progress/control' && ctx.method === 'POST') {
+    const serviceDone = ctx.body?.service_done;
+    const entryReceipt = ctx.body?.entry_receipt;
+    if (typeof serviceDone !== 'boolean' && typeof entryReceipt !== 'boolean') {
+      return {
+        status: 400,
+        body: {
+          ok: false,
+          code: 'bad_request',
+          error: 'service_done and/or entry_receipt (boolean) required',
+        },
+      };
+    }
+    const hold = controller.setProgressHold({
+      service_done: serviceDone,
+      entry_receipt: entryReceipt,
+    });
+    return { status: 200, body: { ok: true, ...controller.progressChannelStatus(), hold } };
   }
 
   if (path === '/admin/transport' && ctx.method === 'GET') {
@@ -141,10 +182,17 @@ export async function handleCoordinatorRequest(
 /**
  * Records live with the entries. The coordinator fans lookups out so operators
  * get a single endpoint even when the accepting entry has restarted.
+ *
+ * Returns a map keyed by requestId. Entries that are unreachable simply
+ * contribute nothing — the caller falls back to the durable cluster record and
+ * the progress aggregate, so a stopped entry does not hide evidence.
  */
-async function fanOutRecords(entryUrls: string[], ids: string[]): Promise<unknown[]> {
-  if (ids.length === 0) return [];
-  const found = new Map<string, unknown>();
+async function fanOutRecords(
+  entryUrls: string[],
+  ids: string[],
+): Promise<Map<string, Record<string, unknown>>> {
+  const found = new Map<string, Record<string, unknown>>();
+  if (ids.length === 0) return found;
   await Promise.all(
     entryUrls.map(async (url) => {
       const res = await jsonRequest<{ records: { requestId: string }[] }>(url, {
@@ -154,11 +202,11 @@ async function fanOutRecords(entryUrls: string[], ids: string[]): Promise<unknow
       if (res.ok && res.body?.records) {
         for (const record of res.body.records) {
           if (record && typeof record === 'object' && !found.has(record.requestId)) {
-            found.set(record.requestId, record);
+            found.set(record.requestId, record as Record<string, unknown>);
           }
         }
       }
     }),
   );
-  return ids.map((id) => found.get(id) ?? { requestId: id, error: 'not found' });
+  return found;
 }

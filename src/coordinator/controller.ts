@@ -10,6 +10,9 @@ import type {
   EntryProcessDef,
   GroupId,
   PendingSwitch,
+  ProgressEvent,
+  ProgressView,
+  RecordProgressView,
   ReleasePlan,
   ReleaseStateView,
   RollbackState,
@@ -19,8 +22,9 @@ import type {
   Version,
 } from '../shared/types';
 import type { ConfigRepository, CoordinatorRepository } from '../shared/store';
-import { TransportLedger } from '../shared/store';
+import { LedgerRepository, ProgressRepository, TransportLedger } from '../shared/store';
 import { requiredServices, validateConfigDocument, walkRoute } from '../shared/engine';
+import { buildProgressView, expectedRouteSlots } from '../shared/progress';
 import { jsonRequest } from '../shared/http';
 import { PeerClient } from '../shared/peer';
 import { errorMessage, sleep } from '../shared/util';
@@ -58,6 +62,17 @@ export interface DeployResult {
 export class ReleaseController {
   private state: CoordinatorState;
   private recoveryPerformed = false;
+  /**
+   * Fault injection for the progress side channel, per evidence stage. Never
+   * affects execution: while a stage is held the coordinator does not
+   * acknowledge its reports, so producers keep buffering them locally.
+   */
+  private progressHold: Record<'service_done' | 'entry_receipt', boolean> = {
+    service_done: false,
+    entry_receipt: false,
+  };
+  private readonly progress: ProgressRepository;
+  private readonly ledger: LedgerRepository;
 
   constructor(
     private readonly topology: Topology,
@@ -66,6 +81,8 @@ export class ReleaseController {
     private readonly peers = new PeerClient(),
   ) {
     this.state = this.repo.loadState() ?? this.blankState();
+    this.progress = new ProgressRepository(repo.store);
+    this.ledger = new LedgerRepository(repo.store);
   }
 
   private blankState(): CoordinatorState {
@@ -347,6 +364,148 @@ export class ReleaseController {
 
   stateSnapshot(): CoordinatorState {
     return JSON.parse(JSON.stringify(this.state)) as CoordinatorState;
+  }
+
+  /* ------------------------------ progress -------------------------------- */
+
+  /**
+   * Ingest a batch of segment-progress events.
+   *
+   * This endpoint is deliberately independent of release/state locks: it only
+   * merges evidence into the durable per-request aggregate. Malformed events
+   * are counted and skipped, never fatal.
+   */
+  acceptProgress(events: unknown): {
+    ok: true;
+    accepted: number;
+    applied: number;
+    duplicate: number;
+    stale: number;
+    rejected: number;
+    held: number;
+  } {
+    const list = Array.isArray(events) ? (events as Partial<ProgressEvent>[]) : [];
+    let rejected = 0;
+    let held = 0;
+    const valid: ProgressEvent[] = [];
+    for (const event of list) {
+      if (!isProgressEvent(event)) {
+        rejected += 1;
+        continue;
+      }
+      if (this.progressHold[event.stage]) {
+        // Not acknowledged: the producer keeps it in its durable outbox.
+        held += 1;
+        continue;
+      }
+      valid.push(event);
+    }
+    const merged = this.progress.applyMany(valid);
+    return {
+      ok: true,
+      accepted: merged.applied + merged.duplicate + merged.stale,
+      applied: merged.applied,
+      duplicate: merged.duplicate,
+      stale: merged.stale,
+      rejected,
+      held,
+    };
+  }
+
+  /** Operator/fault-control hook for the progress side channel only. */
+  setProgressHold(hold: {
+    service_done?: boolean;
+    entry_receipt?: boolean;
+  }): Record<string, boolean> {
+    if (typeof hold.service_done === 'boolean') this.progressHold.service_done = hold.service_done;
+    if (typeof hold.entry_receipt === 'boolean') this.progressHold.entry_receipt = hold.entry_receipt;
+    return { ...this.progressHold };
+  }
+
+  progressChannelStatus(): { paused: boolean; hold: Record<string, boolean> } {
+    const hold = { ...this.progressHold };
+    return { paused: hold.service_done || hold.entry_receipt, hold };
+  }
+
+  /**
+   * Per-request progress with evidence separated from the authoritative record.
+   *
+   * The request record keeps showing the accepted (pinned) version, status and
+   * result exactly as before. Progress adds, per segment, whether the execution
+   * service finished it and whether the entry acknowledged receipt, plus the
+   * version those proofs actually show — or an explicit gap when absent.
+   */
+  describeRecords(
+    ids: string[],
+    remoteRecords: Map<string, Record<string, unknown>> = new Map(),
+  ): RecordProgressView[] {
+    return ids.map((id) => this.describeRecord(id, remoteRecords.get(id)));
+  }
+
+  private describeRecord(
+    requestId: string,
+    remoteRecord: Record<string, unknown> | undefined,
+  ): RecordProgressView {
+    const acceptedEntry = this.ledger.getEntry(requestId);
+    const clusterRecord = this.ledger.getRecord(requestId);
+    const record = (remoteRecord as Record<string, unknown> | undefined) ?? clusterRecord;
+    const stored = this.progress.get(requestId);
+
+    const version =
+      (record?.version as Version | undefined) ??
+      acceptedEntry?.version ??
+      undefined;
+    const group = (record?.group as GroupId | undefined) ?? acceptedEntry?.group;
+    const doc = version ? this.configs.get(version) : undefined;
+    const expected = doc && group ? expectedRouteSlots(doc, group) : [];
+    const recordSegments = Array.isArray(record?.segments)
+      ? (record!.segments as RecordProgressView['segments'])
+      : undefined;
+
+    const progress = buildProgressView({
+      stored,
+      expected,
+      recordSegments,
+      ingestPaused: this.progressHold.service_done || this.progressHold.entry_receipt,
+    });
+    const recordDone = record?.status === 'done';
+    // If the authoritative record proves the work finished but the aggregate
+    // holds no proof for those segments, the progress path is behind — say so
+    // rather than pretending the segment never ran.
+    if (recordDone && progress.summary.withGaps > 0 && progress.channel === 'flowing') {
+      progress.channel = 'interrupted';
+      progress.gaps.push('progress channel interrupted; reports are buffered by producers');
+    }
+
+    const view: RecordProgressView = {
+      requestId,
+      recordAvailable: Boolean(record),
+      accepted: acceptedEntry
+        ? {
+            version: acceptedEntry.version,
+            group: acceptedEntry.group,
+            acceptedBy: acceptedEntry.acceptedBy,
+            acceptedAt: acceptedEntry.acceptedAt,
+            bindingEpoch: acceptedEntry.bindingEpoch,
+            path: acceptedEntry.path,
+          }
+        : null,
+      progress,
+    };
+    if (record) {
+      view.version = record.version as Version;
+      view.group = record.group as GroupId;
+      view.status = (record.status as RecordProgressView['status']) ?? 'unknown';
+      view.output = record.output;
+      view.segments = recordSegments;
+      view.retries = record.retries as number | undefined;
+      view.error = record.error as string | undefined;
+    } else if (!acceptedEntry && !stored) {
+      // Preserve the old "not found" signal for ids nobody has ever seen.
+      view.notFound = true;
+      view.error = 'not found';
+    }
+    return view;
   }
 
   /* --------------------------------- ops ----------------------------------- */
@@ -1012,4 +1171,25 @@ export class ReleaseController {
       await this.installOnServices(doc, names);
     }
   }
+}
+
+/** Structural validation of a progress report; loose on optional fields. */
+function isProgressEvent(value: unknown): value is ProgressEvent {
+  if (!value || typeof value !== 'object') return false;
+  const event = value as Partial<ProgressEvent>;
+  return (
+    (event.stage === 'service_done' || event.stage === 'entry_receipt') &&
+    (event.role === 'service' || event.role === 'entry') &&
+    typeof event.eventId === 'string' &&
+    event.eventId.length > 0 &&
+    typeof event.requestId === 'string' &&
+    event.requestId.length > 0 &&
+    typeof event.slot === 'string' &&
+    event.slot.length > 0 &&
+    typeof event.service === 'string' &&
+    typeof event.version === 'string' &&
+    typeof event.producer === 'string' &&
+    typeof event.at === 'number' &&
+    Number.isFinite(event.at)
+  );
 }

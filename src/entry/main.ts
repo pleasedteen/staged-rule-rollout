@@ -25,6 +25,7 @@ import {
 import { ConfigCache } from '../shared/configCache';
 import { jsonRequest, startJsonServer, type JsonServer } from '../shared/http';
 import { PeerClient } from '../shared/peer';
+import { ProgressOutbox } from '../shared/progress';
 import { joinValues, routePath, RuleError } from '../shared/engine';
 import {
   coordinatorUrl,
@@ -69,6 +70,8 @@ class EntryGateway {
   private readonly cache: ConfigCache;
   private readonly ledger: LedgerRepository;
   private readonly peers = new PeerClient();
+  /** Durable outbox of per-segment receipt evidence for the coordinator. */
+  private readonly progress: ProgressOutbox;
   private readonly binding: BindingState = {
     epoch: 0,
     versions: {},
@@ -109,6 +112,7 @@ class EntryGateway {
       role: `entry:${name}`,
     });
     this.ledger = new LedgerRepository(cluster);
+    this.progress = new ProgressOutbox(local, coordinatorUrl(topology), name, 'entry');
   }
 
   static async start(
@@ -157,6 +161,9 @@ class EntryGateway {
     // This is what lets a stopped coordinator coexist with live traffic.
     this.syncTimer = setInterval(() => void this.sync(), 200);
     this.syncTimer.unref?.();
+    // Receipt evidence is buffered locally and drained best-effort; start
+    // draining immediately so evidence recorded before a restart is backfilled.
+    this.progress.start();
     logEvent(this.name, 'listening', {
       url: this.server.url,
       instance: this.instance,
@@ -316,10 +323,24 @@ class EntryGateway {
       if (res.ok && res.body?.ok) {
         this.transport.requests += 1;
         this.transport.requestBytes += res.bytesOut;
+        const version = res.body.version ?? record.version;
+        // Persist the receipt proof locally before returning: this is what
+        // lets an operator see, per segment, that the entry took delivery —
+        // even if this entry is stopped while the business completion is
+        // still outstanding downstream.
+        this.progress.emit({
+          stage: 'entry_receipt',
+          instance: this.instance,
+          requestId: record.requestId,
+          slot,
+          service,
+          version,
+          entry: this.name,
+        });
         return {
           service,
           instance: res.body.instance ?? service,
-          version: res.body.version ?? record.version,
+          version,
           group: record.group,
           slot,
           input,
@@ -828,6 +849,7 @@ class EntryGateway {
 
   async close(): Promise<void> {
     if (this.syncTimer) clearInterval(this.syncTimer);
+    this.progress.stop();
     await this.server?.close();
     this.cluster.close();
     this.local.close();

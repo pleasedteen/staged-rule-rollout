@@ -17,6 +17,7 @@ import {
 import { ConfigCache } from '../shared/configCache';
 import { startJsonServer, type JsonServer } from '../shared/http';
 import { applyRule, RuleError } from '../shared/engine';
+import { ProgressOutbox } from '../shared/progress';
 import {
   coordinatorUrl,
   fatal,
@@ -47,6 +48,12 @@ interface Transport {
 class ExecutionService {
   private readonly cache: ConfigCache;
   private readonly journal: ServiceJournal;
+  /**
+   * Completion evidence for the progress side channel. Purely additive: the
+   * write-ahead journal stays the service's exclusive record of what it ran;
+   * this outbox only publishes that a unit finished (with the version proof).
+   */
+  private readonly progress: ProgressOutbox;
   private readonly transport: Transport = {
     configBytes: 0,
     configFetches: 0,
@@ -68,6 +75,7 @@ class ExecutionService {
       role: `service:${name}`,
     });
     this.journal = new ServiceJournal(local, name);
+    this.progress = new ProgressOutbox(local, coordinatorUrl(topology), name, 'service');
   }
 
   static async start(name: string, topology: Topology, dataDir: string): Promise<ExecutionService> {
@@ -96,9 +104,13 @@ class ExecutionService {
       }
       const done = this.compute(entry, doc);
       this.journal.put({ ...done, healed: true, bootInstance: this.instance, updatedAt: Date.now() });
+      this.publishCompletion(done, { recovered: true, healed: true });
       healed += 1;
     }
     if (healed > 0) logEvent(this.name, 'healed journaled units after restart', { healed });
+
+    // Drain evidence buffered before a restart (e.g. coordinator was down).
+    this.progress.start();
 
     const port = this.topology.services.find((service) => service.name === this.name)?.port;
     if (!port) throw new Error(`service ${this.name} missing from topology`);
@@ -147,6 +159,29 @@ class ExecutionService {
         updatedAt: Date.now(),
       };
     }
+  }
+
+  /**
+   * Publish a completion proof for one journaled unit. Only called once the
+   * unit is durably `done` in the journal, so the evidence always corresponds
+   * to a finished execution and never invents a segment that did not run.
+   */
+  private publishCompletion(
+    entry: JournalEntry,
+    flags: { recovered?: boolean; healed?: boolean; ms?: number } = {},
+  ): void {
+    this.progress.emit({
+      stage: 'service_done',
+      instance: this.instance,
+      requestId: entry.requestId,
+      slot: entry.slot,
+      service: entry.service,
+      version: entry.version,
+      ok: !entry.error,
+      recovered: Boolean(flags.recovered),
+      healed: Boolean(flags.healed),
+      ms: flags.ms,
+    });
   }
 
   private async handle(ctx: {
@@ -290,6 +325,10 @@ class ExecutionService {
     const existing = this.journal.get(key);
     if (existing && existing.state === 'done') {
       const recovered = Boolean(existing.healed) || existing.bootInstance !== this.instance;
+      // A retry that hits a finished unit still proves the segment completed;
+      // report it so late/repeated delivery can fill evidence gaps without
+      // duplicating the segment (the coordinator keys by request × slot).
+      this.publishCompletion(existing, { recovered: true, healed: Boolean(existing.healed) });
       const response: ExecuteResponse = {
         ok: !existing.error,
         service: this.name,
@@ -329,14 +368,16 @@ class ExecutionService {
     try {
       if (delayMs > 0) await sleep(delayMs);
       const done = this.compute(pending, doc);
-      this.journal.put({ ...done, updatedAt: Date.now() });
+      const finishedAt = Date.now();
+      this.journal.put({ ...done, updatedAt: finishedAt });
+      this.publishCompletion(done, { recovered: false, healed: false, ms: finishedAt - startedAt });
       const response: ExecuteResponse = {
         ok: !done.error,
         service: this.name,
         instance: this.instance,
         version,
         output: done.output,
-        ms: Date.now() - startedAt,
+        ms: finishedAt - startedAt,
         recovered: false,
         error: done.error,
         code: done.errorCode,
@@ -348,6 +389,7 @@ class ExecutionService {
   }
 
   async close(): Promise<void> {
+    this.progress.stop();
     await this.server?.close();
     this.local.close();
   }

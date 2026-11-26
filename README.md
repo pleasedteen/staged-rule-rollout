@@ -13,13 +13,13 @@
 
 ```bash
 npm install          # 安装 typescript / @types/node（仅开发依赖）
-npm run validate     # 构建 + 启动真实多进程集群 + 跑全部 72 项断言，约 20s
+npm run validate     # 构建 + 启动真实多进程集群 + 跑全部 94 项断言，约 24s
 ```
 
 `npm run validate` 结束时打印类似：
 
 ```
-ALL CHECKS PASSED (72/72), Elapsed: 19.7s (limit 80s)
+ALL CHECKS PASSED (94/94), Elapsed: 23.6s (limit 80s)
 ```
 
 同时把结构化结果写入 `.run/validation-report.json`。
@@ -131,6 +131,29 @@ fixture 中 v1 是数值管线、v2 是字符串管线，彼此的规则类型�
 
 ---
 
+## 3.7 分段进度与执行证据（`/admin/records`）
+
+执行证据与业务执行解耦：即便请求仍在跑，也能**按段**分开查看两件事，而不是等整体结束。
+
+- **服务完成**（`serviceCompleted`）：执行服务把某个执行单元写前日志落为 `done` 后，把
+  「已完成 + 实际版本」作为完成证据上报。执行服务仍是**执行日志的唯一所有者**；进度通路只
+  读取/发布既有事实，不改写日志、不参与计算。
+- **入口收讫**（`entryReceipt`）：入口收到该段的结果并持久记录后上报「已收讫 + 实际版本」。
+- **实际版本**（`actualVersion`）：由上述证据证明的版本；缺证据时为 `null` 并在 `gaps` 中
+  点名缺口（`service_completion` / `entry_receipt`），绝不猜测。
+- **原有字段照常显示**：`version`（首次受理钉住的版本）、`status`、`output`、`segments` 等
+  保持原有语义，新增 `progress` 只做并列呈现。
+
+每个期望的路由段（按 `slot` 键）都会列出，**同一段不会因重复或迟到上报而出现两次或倒退**：
+证据以 `(requestId, slot)` 为键，后到的报告只能补齐缺失字段，不能改写已观测字段。
+
+进度通路（生产者 → 协调器）**独立于业务执行**。生产者先把证据写入**本地持久 outbox** 再
+尽力投递；通路中断时业务照常返回正确结果，查询标记 `channel: "interrupted"` 与缺口，生产者
+重启或通路恢复后自动补投，把原请求的完成与收讫证据补齐。`POST /admin/progress/control`
+可显式扣住某一段证据以复现两种故障时序（验证章节 15、16）。
+
+---
+
 ## 4. 崩溃与重启恢复
 
 ### 4.1 协调器崩溃
@@ -193,7 +216,10 @@ fixture 中 v1 是数值管线、v2 是字符串管线，彼此的规则类型�
 | POST | `/ops/recover` | 手动触发恢复对账 |
 | POST | `/ops/deploy {version, services?}` | 向执行服务下发指定版本 |
 | GET  | `/admin/entries` / `/admin/services` | 入口 / 服务探测 |
-| GET  | `/admin/records?ids=a,b` | 扇出查询请求记录 |
+| GET  | `/admin/records?ids=a,b` | 请求记录 + 分段进度证据（完成 / 收讫 / 实际版本 / 缺口） |
+| POST | `/admin/progress` | 生产者上报分段证据（幂等，按 request×slot 合并） |
+| GET  | `/admin/progress/control` | 查看进度通路是否被扣住 |
+| POST | `/admin/progress/control` | `{service_done?, entry_receipt?}` 扣住/放行证据（故障夹具） |
 | GET  | `/admin/transport` | 聚合配置传输计量 |
 
 ### 入口（:7401/:7402/:7403）
@@ -266,7 +292,7 @@ kill -9 <entry-pid>                # 入口崩溃；在另一入口 POST /retry 
 
 ---
 
-## 9. 验证覆盖（`npm run validate`，72 项断言）
+## 9. 验证覆盖（`npm run validate`，94 项断言）
 
 1. 启动 & 初始状态（全 v1）
 2. 首次受理钉住版本；段版本一致（含并行分支）；结果匹配独立 oracle
@@ -281,7 +307,13 @@ kill -9 <entry-pid>                # 入口崩溃；在另一入口 POST /retry 
 11. 入口崩溃后跨入口 `/retry`：沿用钉住版本并得到正确结果
 12. 请求量 24 → 全量配置传输字节 `delta == 0`；每请求仍执行完整路由
 13. 版本混用被显式拒绝（类型错误 / 版本未安装）
-14. 终态一致：全部批次生效；旧版本在发布完成后仍可执行
+14. **请求仍在跑时按段分开看**：每个路由段单独列出，已完成的段同时显示服务完成与入口收讫，
+   尚未执行的段标出缺口；完成后各段均为钉住实际版本，原有受理版本/状态/结果不变
+15. **服务完成已交付、入口收讫被扣住**：停掉入口与执行服务后仍能查到完成进度与实际版本，
+    收讫显示为「尚未观察到」；生产者重启并放行后补齐原请求的完成与收讫证据
+16. **进度通路中断**：业务照常返回正确结果，查询标出缺口；恢复通路后补齐原请求证据；
+    重复/迟到上报不使同一段重复出现或版本/状态倒退
+17. 终态一致：全部批次生效；旧版本在发布完成后仍可执行
 
 ---
 
@@ -289,10 +321,10 @@ kill -9 <entry-pid>                # 入口崩溃；在另一入口 POST /retry 
 
 ```
 src/
-  shared/      types, http, store(集群=文件锁 / 本地=SQLite), engine(路由/规则), configCache, peer, runtime, util
-  coordinator/ controller(发布状态机), server(HTTP), main(进程)
-  entry/       main(受理/执行/恢复/两阶段绑定)
-  service/     main(执行 + 写前日志自愈)
+  shared/      types, http, store(集群=文件锁 / 本地=SQLite), engine(路由/规则), configCache, progress(分段证据), peer, runtime, util
+  coordinator/ controller(发布状态机 + 进度汇总), server(HTTP), main(进程)
+  entry/       main(受理/执行/恢复/两阶段绑定 + 收讫证据)
+  service/     main(执行 + 写前日志自愈 + 完成证据)
   validate/    run(多进程校验器), oracles(独立期望值)
 fixtures/      topology / plan / configs / requests / faults
 docs/          OPERATIONS.md（运维与故障复现）

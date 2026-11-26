@@ -255,6 +255,69 @@ interface RecordView {
   error?: string;
 }
 
+interface ProgressEvidence {
+  observed: boolean;
+  version: string | null;
+  at: number | null;
+  instance?: string | null;
+  producer?: string | null;
+  entry?: string | null;
+  recovered?: boolean;
+  healed?: boolean;
+  ok?: boolean;
+}
+
+interface ProgressSegment {
+  slot: string;
+  service: string;
+  order: number;
+  serviceCompleted: ProgressEvidence;
+  entryReceipt: ProgressEvidence;
+  actualVersion: string | null;
+  recordVersion: string | null;
+  gaps: string[];
+  state: string;
+  conflict?: boolean;
+}
+
+interface ProgressView {
+  channel: string;
+  expected: number;
+  actualVersion: string | null;
+  segments: ProgressSegment[];
+  summary: {
+    total: number;
+    serviceCompleted: number;
+    receiptsObserved: number;
+    confirmed: number;
+    withGaps: number;
+    complete: boolean;
+  };
+  gaps: string[];
+  updatedAt: number | null;
+}
+
+interface ProgressRecordView {
+  requestId: string;
+  recordAvailable: boolean;
+  version?: string;
+  group?: string;
+  status?: string;
+  output?: unknown;
+  segments?: { service: string; version: string; recovered: boolean; slot: string; output: unknown }[];
+  retries?: number;
+  error?: string;
+  accepted: {
+    version: string;
+    group: string;
+    acceptedBy: string;
+    acceptedAt: number;
+    bindingEpoch: number | null;
+    path: string[];
+  } | null;
+  progress: ProgressView;
+}
+
 const state = async (detail = false): Promise<StateView> => {
   const res = await jsonRequest<StateView>(coordinatorBase, {
     path: detail ? '/admin/state?detail=1' : '/admin/state',
@@ -318,6 +381,60 @@ const entryBindings = async (
     timeoutMs: 3000,
   });
   return res.ok ? res.body : undefined;
+};
+
+/** Query per-request progress evidence from the coordinator. */
+const progressRecords = async (ids: string[]): Promise<ProgressRecordView[]> => {
+  const res = await jsonRequest<{ ok: boolean; records: ProgressRecordView[] }>(coordinatorBase, {
+    path: `/admin/records?ids=${ids.join(',')}`,
+    timeoutMs: 6000,
+  });
+  return res.ok ? (res.body.records ?? []) : [];
+};
+
+/** Poll a request's progress until every expected segment is confirmed. */
+const waitProgressComplete = async (
+  requestId: string,
+  timeoutMs = 8000,
+): Promise<ProgressRecordView | undefined> => {
+  const deadline = Date.now() + timeoutMs;
+  let last: ProgressRecordView | undefined;
+  while (Date.now() < deadline) {
+    last = (await progressRecords([requestId]))[0];
+    if (last?.progress.summary.complete) return last;
+    await sleep(40);
+  }
+  return last ?? (await progressRecords([requestId]))[0];
+};
+
+/** Poll until a predicate holds over the request's progress view. */
+const waitProgress = async (
+  requestId: string,
+  predicate: (view: ProgressRecordView) => boolean,
+  timeoutMs = 8000,
+): Promise<ProgressRecordView | undefined> => {
+  const deadline = Date.now() + timeoutMs;
+  let last: ProgressRecordView | undefined;
+  while (Date.now() < deadline) {
+    last = (await progressRecords([requestId]))[0];
+    if (last && predicate(last)) return last;
+    await sleep(40);
+  }
+  return last;
+};
+
+const setProgressChannel = async (hold: {
+  service_done?: boolean;
+  entry_receipt?: boolean;
+}): Promise<boolean> => {
+  const res = await jsonRequest<{ ok: boolean; hold?: Record<string, boolean> }>(coordinatorBase, {
+    path: '/admin/progress/control',
+    body: hold,
+    timeoutMs: 3000,
+  });
+  if (!res.ok || !res.body?.ok) return false;
+  const applied = res.body.hold ?? {};
+  return Object.entries(hold).every(([stage, value]) => applied[stage] === value);
 };
 
 /** Wait until every entry has observed a binding for every group it serves. */
@@ -908,8 +1025,276 @@ async function main(): Promise<number> {
       );
     }
 
-    /* -------------------------- 14. final sanity -------------------------- */
-    report.section('14. Final consistency');
+    /* ------------- 14. live progress evidence while running --------------- */
+    report.section('14. /admin/records shows per-segment progress while running');
+    {
+      // currency's fx-tag branch has a 500 ms delay: this request is still
+      // executing while we query it, so progress must be visible mid-flight.
+      const receipt = await accept('entry-a', 'currency', 777);
+      report.check(receipt.status === 200, 'long request accepted', receipt.body.requestId);
+
+      const running = await waitProgress(
+        receipt.body.requestId,
+        (view) => view.progress.segments.some((segment) => segment.state === 'confirmed'),
+        6000,
+      );
+      const runningProgress = running?.progress;
+      report.check(
+        Boolean(runningProgress) && runningProgress!.segments.length === 4,
+        'each route segment appears separately before completion',
+        (runningProgress?.segments ?? []).map((s) => `${s.slot}:${s.state}`).join(' | '),
+      );
+      const confirmed = (runningProgress?.segments ?? []).filter((s) => s.state === 'confirmed');
+      report.check(
+        confirmed.length >= 1 &&
+          confirmed.every((s) => s.serviceCompleted.observed && s.entryReceipt.observed),
+        'a finished segment shows both service completion and entry receipt',
+        confirmed.map((s) => `${s.service}[svc=${s.serviceCompleted.observed},rcpt=${s.entryReceipt.observed}]`).join(' '),
+      );
+      report.check(
+        running !== undefined && running.version === 'v2' && running.status === 'running',
+        'original accepted version and status still shown',
+        `status=${running?.status} version=${running?.version}`,
+      );
+      // The slow fx-tag branch has not produced evidence yet: its segment is
+      // listed with both gaps and no claimed version.
+      const pending = (runningProgress?.segments ?? []).find((s) => s.state === 'pending');
+      report.check(
+        pending !== undefined &&
+          pending.serviceCompleted.observed === false &&
+          pending.entryReceipt.observed === false &&
+          pending.actualVersion === null &&
+          pending.gaps.includes('service_completion') &&
+          pending.gaps.includes('entry_receipt'),
+        'a not-yet-executed segment is listed with an explicit gap',
+        `state=${pending?.state} gaps=${(pending?.gaps ?? []).join(',')} actual=${pending?.actualVersion}`,
+      );
+
+      // Once it finishes, every segment is confirmed with actual version v2.
+      const completedRecord = await waitRecord('entry-a', receipt.body.requestId, 20000);
+      const done = await waitProgressComplete(receipt.body.requestId, 10000);
+      report.check(
+        done?.progress.summary.complete === true &&
+          done.progress.segments.every((s) => s.state === 'confirmed') &&
+          done.progress.segments.every((s) => s.actualVersion === 'v2') &&
+          done.progress.actualVersion === 'v2',
+        'after completion every segment is confirmed at the executed version',
+        (done?.progress.segments ?? []).map((s) => `${s.slot}:${s.state}@${s.actualVersion}`).join(' '),
+      );
+      report.check(
+        completedRecord?.version === 'v2' &&
+          completedRecord.status === 'done' &&
+          done?.version === 'v2' &&
+          done.status === 'done' &&
+          recordsEqual(done.output, expectedCurrencyV2(777)) &&
+          recordsEqual(completedRecord.output, expectedCurrencyV2(777)),
+        'original result is still returned unchanged alongside progress',
+        `v=${completedRecord?.version} status=${completedRecord?.status} out=${JSON.stringify(completedRecord?.output)}`,
+      );    }
+
+    /* --------- 15. progress held back; evidence survives stops ----------- */
+    report.section('15. Completion delivered but receipt withheld; evidence survives');
+    {
+      // Hold back the entry-receipt stage only (execution and service-progress
+      // keep flowing). A currency request's fast segments then finish while the
+      // slow fx-tag branch is still running: completion visible, receipt withheld.
+      report.check(
+        await setProgressChannel({ entry_receipt: true }),
+        'entry-receipt evidence can be held back independently of execution',
+        'hold.entry_receipt=true',
+      );
+      const receipt = await accept('entry-a', 'currency', 888);
+      report.check(receipt.status === 200, 'request accepted while progress is held back', receipt.body.requestId);
+      const running = await waitProgress(
+        receipt.body.requestId,
+        (view) => view.progress.segments.some((s) => s.state === 'service_done_unacked'),
+        6000,
+      );
+      const delivered = (running?.progress.segments ?? []).find(
+        (s) => s.state === 'service_done_unacked',
+      );
+      report.check(
+        Boolean(delivered) &&
+          delivered!.serviceCompleted.observed &&
+          !delivered!.entryReceipt.observed,
+        'service completion observed while the entry receipt is still withheld',
+        (running?.progress.segments ?? [])
+          .map((s) => `${s.service}[svc=${s.serviceCompleted.observed},rcpt=${s.entryReceipt.observed}]`)
+          .join(' '),
+      );
+
+      // The business request still completes correctly on its pinned version.
+      const completed = await waitRecord('entry-a', receipt.body.requestId, 25000);
+      report.check(
+        completed?.status === 'done' &&
+          completed.version === 'v2' &&
+          recordsEqual(completed.output, expectedCurrencyV2(888)),
+        'business result is correct even though the progress path is interrupted',
+        `status=${completed?.status} v=${completed?.version} out=${JSON.stringify(completed?.output)}`,
+      );
+
+      // Stop the entry and the execution service: everything for this request
+      // is now down. Progress evidence and the actual version must remain
+      // queryable, with the withheld receipt still marked as not observed.
+      await cluster.kill('entry-a');
+      await cluster.kill('fx-tag');
+      const dark = (await progressRecords([receipt.body.requestId]))[0];
+      report.check(
+        dark?.progress.channel === 'interrupted' &&
+          dark.progress.summary.withGaps > 0 &&
+          dark.progress.gaps.length > 0,
+        'query with the entry and service stopped marks the evidence gap',
+        `channel=${dark?.progress.channel} gaps=${(dark?.progress.gaps ?? []).slice(0, 2).join(' | ')}`,
+      );
+      const probedSegment = (dark?.progress.segments ?? []).find((s) => s.serviceCompleted.observed);
+      report.check(
+        probedSegment !== undefined &&
+          probedSegment.actualVersion === 'v2' &&
+          probedSegment.entryReceipt.observed === false,
+        'actual version survives; entry receipt stays "not observed"',
+        `actual=${probedSegment?.actualVersion} rcptObserved=${probedSegment?.entryReceipt.observed}`,
+      );
+      report.check(
+        dark?.recordAvailable === true &&
+          dark.status === 'done' &&
+          dark.version === 'v2' &&
+          recordsEqual(dark.output, expectedCurrencyV2(888)),
+        'the original accepted version, status and result are still shown',
+        `recordAvailable=${dark?.recordAvailable} v=${dark?.version} status=${dark?.status}`,
+      );
+
+      // Restart the producers; buffered evidence drains and the gaps fill.
+      await cluster.restart('fx-tag');
+      await cluster.restart('entry-a');
+      report.check(
+        await setProgressChannel({ entry_receipt: false }),
+        'entry-receipt stage reopened',
+        'hold.entry_receipt=false',
+      );
+      const healed = await waitProgressComplete(receipt.body.requestId, 12000);
+      report.check(
+        healed?.progress.summary.complete === true &&
+          healed.progress.channel === 'flowing' &&
+          healed.progress.segments.every((s) => s.entryReceipt.observed),
+        'a producer restart backfills the withheld completion and receipt evidence',
+        (healed?.progress.segments ?? []).map((s) => `${s.slot}:${s.state}`).join(' '),
+      );
+    }
+
+    /* ------------- 16. progress outage vs. duplicate/late events --------- */
+    report.section('16. Outage, duplication and late reports keep progress monotonic');
+    {
+      // Interrupt the channel, run a full request, then verify the query
+      // reports the gap while the business result is unaffected.
+      await setProgressChannel({ service_done: true });
+      const receipt = await accept('entry-c', 'currency', 999);      const completed = await waitRecord('entry-c', receipt.body.requestId, 25000);
+      report.check(
+        completed?.status === 'done' &&
+          completed.version === 'v2' &&
+          recordsEqual(completed.output, expectedCurrencyV2(999)),
+        'request completes correctly with the progress path interrupted',
+        `status=${completed?.status} out=${JSON.stringify(completed?.output)}`,
+      );
+      const gap = (await progressRecords([receipt.body.requestId]))[0];
+      report.check(
+        gap?.progress.channel === 'interrupted' &&
+          gap.progress.summary.complete === false &&
+          gap.progress.gaps.length > 0 &&
+          gap.progress.segments.every((s) => !s.serviceCompleted.observed),
+        'query marks the progress gap while the result is already correct',
+        `channel=${gap?.progress.channel} gaps=${gap?.progress.gaps.length} observed=${gap?.progress.segments.filter((s) => s.serviceCompleted.observed).length}`,
+      );
+
+      // Restore the path: buffered evidence drains and completes the record.
+      await setProgressChannel({ service_done: false });
+      const drained = await waitProgressComplete(receipt.body.requestId, 12000);
+      report.check(
+        drained?.progress.summary.complete === true &&
+          drained.progress.segments.every((s) => s.actualVersion === 'v2'),
+        'restoring the channel backfills the original request’s evidence',
+        (drained?.progress.segments ?? []).map((s) => `${s.slot}:${s.state}`).join(' '),
+      );
+
+      // Duplicate and late events must not duplicate a segment or rewind it.
+      const before = drained?.progress.segments ?? [];
+      const replay = before.flatMap((segment) => [
+        {
+          eventId: `replay:${segment.slot}:svc`,
+          stage: 'service_done',
+          role: 'service',
+          producer: 'fx-tag',
+          instance: 'fx-tag#99',
+          requestId: receipt.body.requestId,
+          slot: segment.slot,
+          service: segment.service,
+          version: 'v2',
+          at: segment.serviceCompleted.at ?? Date.now(),
+          seq: 1,
+        },
+        {
+          eventId: `replay:${segment.slot}:rcpt`,
+          stage: 'entry_receipt',
+          role: 'entry',
+          producer: 'entry-c',
+          instance: 'entry-c#99',
+          entry: 'entry-c',
+          requestId: receipt.body.requestId,
+          slot: segment.slot,
+          service: segment.service,
+          version: 'v2',
+          at: segment.entryReceipt.at ?? Date.now(),
+          seq: 1,
+        },
+      ]);
+      const replayRes = await jsonRequest<{ ok: boolean; accepted?: number }>(coordinatorBase, {
+        path: '/admin/progress',
+        body: { events: replay },
+        timeoutMs: 4000,
+      });
+      // A late, contradicting report arrives afterwards as well.
+      await jsonRequest(coordinatorBase, {
+        path: '/admin/progress',
+        body: {
+          events: before.map((segment) => ({
+            eventId: `late:${segment.slot}`,
+            stage: 'service_done',
+            role: 'service',
+            producer: 'fx-tag',
+            instance: 'fx-tag#99',
+            requestId: receipt.body.requestId,
+            slot: segment.slot,
+            service: segment.service,
+            version: 'v1',
+            at: Date.now() + 5000,
+            seq: 2,
+          })),
+        },
+        timeoutMs: 4000,
+      });
+      const after = (await progressRecords([receipt.body.requestId]))[0];
+      report.check(
+        replayRes.ok && after !== undefined,
+        'duplicate reports are accepted idempotently',
+        `accepted=${replayRes.body?.accepted}`,
+      );
+      report.check(
+        after?.progress.segments.length === before.length &&
+          new Set(after.progress.segments.map((s) => s.slot)).size === after.progress.segments.length,
+        'no segment appears twice after duplicate reports',
+        (after?.progress.segments ?? []).map((s) => s.slot).join(' | '),
+      );
+      report.check(
+        after?.progress.actualVersion === 'v2' &&
+          after.progress.segments.every(
+            (s) => s.actualVersion === 'v2' && s.state === 'confirmed',
+          ),
+        'late/contradicting reports do not rewind segment versions or state',
+        (after?.progress.segments ?? []).map((s) => `${s.slot}:${s.actualVersion}:${s.state}`).join(' '),
+      );
+    }
+
+    /* -------------------------- 17. final sanity -------------------------- */
+    report.section('17. Final consistency');
     {
       const final = await state(true);
       report.check(

@@ -12,8 +12,10 @@ import type {
   BindingsView,
   ConfigDocument,
   CoordinatorState,
+  ProgressEvent,
   RequestLedgerEntry,
   RequestRecord,
+  StoredProgressRecord,
   Version,
 } from './types';
 import { bundleMeta } from './util';
@@ -371,6 +373,139 @@ export class LocalConfigCache {
       .map((key) => key.slice(this.prefix.length))
       .sort();
   }
+}
+
+/* ----------------------------- Progress ledger ---------------------------- */
+
+/**
+ * Durable, idempotent accumulator of segment progress evidence.
+ *
+ * Lives in the cluster store so the coordinator owns the single aggregate even
+ * when several producers report concurrently. Semantics that the query path
+ * depends on:
+ *   - keyed by (requestId, slot) — one segment can never appear twice;
+ *   - re-delivered / late events can only fill a missing field, never change a
+ *     field already observed (no regress, no reorder);
+ *   - every accepted event is counted so the aggregate is observable.
+ */
+export class ProgressRepository {
+  constructor(private readonly store: KvStore) {}
+
+  private key(requestId: string): string {
+    return `progress:${requestId}`;
+  }
+
+  get(requestId: string): StoredProgressRecord | undefined {
+    return this.store.get<StoredProgressRecord>(this.key(requestId));
+  }
+
+  /** Merge one event; returns whether it added anything new. */
+  apply(event: ProgressEvent): 'applied' | 'duplicate' | 'stale' {
+    return this.applyMany([event]).outcomes[0] ?? 'stale';
+  }
+
+  /**
+   * Merge a batch with one read-modify-write per affected request. Producers
+   * report in bursts; coalescing keeps contention on the shared cluster file
+   * proportional to requests rather than to events.
+   */
+  applyMany(events: ProgressEvent[]): {
+    outcomes: ('applied' | 'duplicate' | 'stale')[];
+    applied: number;
+    duplicate: number;
+    stale: number;
+  } {
+    const byRequest = new Map<string, { event: ProgressEvent; index: number }[]>();
+    events.forEach((event, index) => {
+      const list = byRequest.get(event.requestId);
+      if (list) list.push({ event, index });
+      else byRequest.set(event.requestId, [{ event, index }]);
+    });
+    const outcomes: ('applied' | 'duplicate' | 'stale')[] = new Array(events.length).fill('stale');
+    let applied = 0;
+    let duplicate = 0;
+    let stale = 0;
+    for (const [requestId, list] of byRequest) {
+      const record = this.get(requestId) ?? this.blank(requestId);
+      for (const { event, index } of list) {
+        const outcome = applyEventToRecord(record, event);
+        outcomes[index] = outcome;
+        if (outcome === 'applied') applied += 1;
+        else if (outcome === 'duplicate') duplicate += 1;
+        else stale += 1;
+      }
+      this.store.set(this.key(requestId), record);
+    }
+    return { outcomes, applied, duplicate, stale };
+  }
+
+  private blank(requestId: string): StoredProgressRecord {
+    return { requestId, segments: {}, nextOrder: 0, updatedAt: 0, events: 0 };
+  }
+}
+
+function applyEventToRecord(
+  record: StoredProgressRecord,
+  event: ProgressEvent,
+): 'applied' | 'duplicate' | 'stale' {
+  const existing = record.segments[event.slot];
+  const segment = existing ?? {
+    slot: event.slot,
+    service: event.service,
+    order: record.nextOrder,
+    firstSeenAt: event.at,
+  };
+  if (!existing) record.nextOrder += 1;
+  segment.firstSeenAt = Math.min(segment.firstSeenAt, event.at);
+  record.events += 1;
+
+  let changed = !existing;
+  let duplicate = false;
+
+  if (event.stage === 'service_done') {
+    if (!segment.serviceCompleted) {
+      segment.serviceCompleted = {
+        version: event.version,
+        instance: event.instance,
+        producer: event.producer,
+        at: event.at,
+        recovered: Boolean(event.recovered),
+        healed: Boolean(event.healed),
+        ok: event.ok !== false,
+        ms: event.ms,
+      };
+      changed = true;
+    } else if (segment.serviceCompleted.at === event.at) {
+      duplicate = true;
+    } else if (segment.serviceCompleted.version !== event.version) {
+      // Two independent proofs of completion disagreeing on the version is
+      // itself a gap worth surfacing; keep the first and flag it.
+      if (!segment.conflict) {
+        segment.conflict = true;
+        changed = true;
+      }
+    }
+  } else if (!segment.entryReceipt) {
+    segment.entryReceipt = {
+      version: event.version,
+      entry: event.entry ?? event.producer,
+      instance: event.instance,
+      at: event.at,
+    };
+    changed = true;
+  } else if (segment.entryReceipt.at === event.at) {
+    duplicate = true;
+  } else if (segment.entryReceipt.version !== event.version) {
+    if (!segment.conflict) {
+      segment.conflict = true;
+      changed = true;
+    }
+  }
+
+  record.segments[event.slot] = segment;
+  record.updatedAt = Math.max(record.updatedAt, event.at);
+  if (duplicate && !changed) return 'duplicate';
+  return changed ? 'applied' : 'stale';
 }
 
 /* -------------------------------- Journal --------------------------------- */

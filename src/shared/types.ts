@@ -251,6 +251,169 @@ export interface ExecuteResponse {
   code?: string;
 }
 
+/* -------------------------------- Progress -------------------------------- */
+
+/**
+ * Segment progress travels on a side channel, separate from execution.
+ *
+ * The execution service remains the sole owner of its write-ahead journal; it
+ * only *publishes* completion events. The entry publishes the matching receipt
+ * once it has received a segment result. Both producers keep a durable local
+ * outbox so a temporarily unreachable coordinator cannot lose evidence.
+ */
+export type ProgressStage = 'service_done' | 'entry_receipt';
+export type ProgressRole = 'service' | 'entry';
+
+export interface ProgressEvent {
+  /** Stable id of this report; re-delivery of the same id is idempotent. */
+  eventId: string;
+  stage: ProgressStage;
+  role: ProgressRole;
+  /** Process name that produced the event (e.g. `fx-tag`, `entry-a`). */
+  producer: string;
+  /** Boot instance of the producer. */
+  instance: string;
+  requestId: string;
+  slot: string;
+  service: ServiceName;
+  /** Version the evidence proves was actually executed / received. */
+  version: Version;
+  at: number;
+  /** Per-producer monotonic sequence (tie-breaker for late reports). */
+  seq: number;
+  /** Entry that received the segment (receipt stage). */
+  entry?: string;
+  /** Service answered from a journaled result after a restart/retry. */
+  recovered?: boolean;
+  /** Result was produced by boot-time journal healing. */
+  healed?: boolean;
+  /** Completion succeeded (false means the rule itself errored). */
+  ok?: boolean;
+  ms?: number;
+}
+
+export interface StoredServiceEvidence {
+  version: Version;
+  instance: string;
+  producer: string;
+  at: number;
+  recovered: boolean;
+  healed: boolean;
+  ok: boolean;
+  ms?: number;
+}
+
+export interface StoredReceiptEvidence {
+  version: Version;
+  entry: string;
+  instance: string;
+  at: number;
+}
+
+export interface StoredProgressSegment {
+  slot: string;
+  service: ServiceName;
+  /** First-seen display order (expected route order takes precedence). */
+  order: number;
+  firstSeenAt: number;
+  serviceCompleted?: StoredServiceEvidence;
+  entryReceipt?: StoredReceiptEvidence;
+  /** Evidence for one slot disagreed on version; first version is kept. */
+  conflict?: boolean;
+}
+
+export interface StoredProgressRecord {
+  requestId: string;
+  segments: Record<string, StoredProgressSegment>;
+  nextOrder: number;
+  updatedAt: number;
+  events: number;
+}
+
+export interface ProgressEvidenceView {
+  observed: boolean;
+  version: Version | null;
+  at: number | null;
+  instance?: string | null;
+  producer?: string | null;
+  entry?: string | null;
+  recovered?: boolean;
+  healed?: boolean;
+  ok?: boolean;
+}
+
+export type ProgressSegmentState =
+  | 'pending'
+  | 'service_done_unacked'
+  | 'receipt_only'
+  | 'confirmed';
+
+export interface ProgressSegmentView {
+  slot: string;
+  service: ServiceName;
+  order: number;
+  /** Service-side completion evidence (execution service). */
+  serviceCompleted: ProgressEvidenceView;
+  /** Entry-side acknowledgement that it received the segment result. */
+  entryReceipt: ProgressEvidenceView;
+  /** Version proven by evidence (service first, then receipt); null on a gap. */
+  actualVersion: Version | null;
+  /** Version the authoritative request record reports for this slot, if any. */
+  recordVersion: Version | null;
+  gaps: ('service_completion' | 'entry_receipt')[];
+  state: ProgressSegmentState;
+  conflict?: boolean;
+}
+
+export interface ProgressView {
+  /** `interrupted` means the side channel rejected reports at query time. */
+  channel: 'flowing' | 'interrupted';
+  expected: number;
+  /** Version that the observed evidence proves was actually executed. */
+  actualVersion: Version | null;
+  segments: ProgressSegmentView[];
+  summary: {
+    total: number;
+    serviceCompleted: number;
+    receiptsObserved: number;
+    confirmed: number;
+    withGaps: number;
+    complete: boolean;
+  };
+  gaps: string[];
+  updatedAt: number | null;
+}
+
+/** Accepted-pin metadata straight from the shared ledger. */
+export interface AcceptedPinView {
+  version: Version;
+  group: GroupId;
+  acceptedBy: string;
+  acceptedAt: number;
+  bindingEpoch: number | null;
+  path: ServiceName[];
+}
+
+/**
+ * `/admin/records` item: the original record fields (when available) plus
+ * separately queryable per-segment progress evidence.
+ */
+export interface RecordProgressView {
+  requestId: string;
+  recordAvailable: boolean;
+  /** True when neither the entry, cluster record nor ledger knows the id. */
+  notFound?: boolean;
+  version?: Version;
+  group?: GroupId;
+  status?: RequestStatus | 'unknown';
+  output?: unknown;
+  segments?: SegmentResult[];
+  retries?: number;
+  error?: string;
+  accepted: AcceptedPinView | null;
+  progress: ProgressView;
+}
+
 /* --------------------------------- Release -------------------------------- */
 
 export interface BlockedReason {

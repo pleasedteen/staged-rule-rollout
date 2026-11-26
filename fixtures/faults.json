@@ -56,6 +56,34 @@
         "POST entry-b /retry {requestId} -> resumes from the shared ledger with the pinned version",
         "GET entry-b /requests/:id    -> correct result, retries >= 1"
       ]
+    },
+    {
+      "name": "progress-live-while-running",
+      "steps": [
+        "POST entry-a /accept (currency) -> fx-tag delays ~500ms",
+        "GET /admin/records?ids=<id> -> each route segment listed separately",
+        "                             -> finished segments show serviceCompleted + entryReceipt",
+        "                             -> not-yet-run segments show explicit gaps, actualVersion=null"
+      ]
+    },
+    {
+      "name": "progress-withheld-receipt-then-restart",
+      "steps": [
+        "POST /admin/progress/control {entry_receipt:true} -> hold receipt evidence (execution unaffected)",
+        "POST entry-a /accept (currency)    -> service completions visible, receipts withheld",
+        "stop entry-a and fx-tag            -> GET /admin/records still shows progress + actual version, receipt 'not observed'",
+        "restart fx-tag and entry-a, POST /admin/progress/control {entry_receipt:false}",
+        "GET /admin/records?ids=<id>        -> buffered completion and receipt evidence backfilled"
+      ]
+    },
+    {
+      "name": "progress-path-outage-duplicates-late",
+      "steps": [
+        "POST /admin/progress/control {service_done:true} -> interrupt the progress path",
+        "POST entry-c /accept + wait done   -> business result correct; /admin/records marks the gap",
+        "POST /admin/progress/control {service_done:false} -> buffered evidence drains, gap closes",
+        "replay/late events to /admin/progress -> no segment duplicated, no version/state rewind"
+      ]
     }
   ]
 }

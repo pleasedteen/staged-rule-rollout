@@ -109,6 +109,35 @@ export function walkRoute(step: RouteStep, visit: (step: RouteStep, slot: string
   if (step.next) walkRoute(step.next, visit, `${slot}.next`);
 }
 
+/** One service invocation in a route, with its stable execution slot key. */
+export interface RouteSlot {
+  service: ServiceName;
+  slot: string;
+}
+
+/**
+ * Enumerate a route's executable slots in traversal order.
+ *
+ * The slot key is the one the entry sends to `/execute` and the execution
+ * service journals under: the path of the node, where a branch child extends
+ * the path with `<service>[b<index>]` and a `next` keeps the path unchanged.
+ * Progress evidence is keyed by the same string, so the two sides always agree
+ * on what "the same segment" means.
+ */
+export function routeSlots(
+  step: RouteStep,
+  path: ServiceName[] = [],
+  out: RouteSlot[] = [],
+): RouteSlot[] {
+  const slot = [...path, step.service].join('>');
+  out.push({ service: step.service, slot });
+  (step.branch ?? []).forEach((child, index) =>
+    routeSlots(child, [...path, `${step.service}[b${index}]`], out),
+  );
+  if (step.next) routeSlots(step.next, path, out);
+  return out;
+}
+
 export function routePath(doc: ConfigDocument, group: string): ServiceName[] {
   const route = doc.routes[group];
   if (!route) {

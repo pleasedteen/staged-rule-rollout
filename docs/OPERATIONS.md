@@ -160,14 +160,85 @@ kill -9 $(pgrep -f 'entry/main.js.*--name entry-a')
 curl -s -X POST $EC/retry -H 'content-type: application/json' -d "{\"requestId\":\"$RID\"}" | jq '{ok,version:.record.version,output:.record.output,retries:.record.retries}'
 ```
 
+### 3.7 请求仍在跑时按段看进度（progress-live-while-running）
+
+`currency` 的 `fx-tag` 分支有 ~500ms 延迟，受理后立刻查询即可看到**执行中的**分段进度：
+
+```bash
+RID=$(curl -s -X POST $EA/accept -H 'content-type: application/json' \
+      -d '{"group":"currency","input":777}' | jq -r .requestId)
+sleep 0.1
+curl -s "$C/admin/records?ids=$RID" | jq '.records[0] | {
+  version, status,
+  progress: {channel: .progress.channel, actualVersion: .progress.actualVersion,
+             segments: [.progress.segments[] | {slot, state,
+               svc: .serviceCompleted.observed, rcpt: .entryReceipt.observed,
+               actual: .actualVersion, gaps}]}
+}'
+```
+
+- 每个路由段单独列出；已完成的段 `serviceCompleted` 与 `entryReceipt` 同时为 `true`。
+- 尚未执行的段 `state:"pending"`，`gaps` 点名 `service_completion` / `entry_receipt`，
+  `actualVersion` 为 `null`（不猜测）。
+- 原有的 `version` / `status` / `output` 仍是首次受理的钉住版本与业务结果。
+
+### 3.8 服务完成已交付、入口收讫被扣住 → 停服后仍可查（progress-withheld-receipt-then-restart）
+
+`entry_receipt` 与 `service_done` 可分别扣住，仅影响进度通路，不影响执行：
+
+```bash
+curl -s -X POST $C/admin/progress/control -H 'content-type: application/json' \
+     -d '{"entry_receipt":true}' | jq .hold
+RID=$(curl -s -X POST $EA/accept -H 'content-type: application/json' \
+      -d '{"group":"currency","input":888}' | jq -r .requestId)
+sleep 0.15
+# 服务已完成、入口收讫仍被扣住：
+curl -s "$C/admin/records?ids=$RID" | jq '.records[0].progress.segments[] | {slot,state,svc:.serviceCompleted.observed,rcpt:.entryReceipt.observed}'
+
+# 停掉入口与执行服务后，仍能查到完成进度 / 实际版本，收讫显示为尚未观察到：
+kill -9 $(pgrep -f 'entry/main.js.*--name entry-a')
+kill -9 $(pgrep -f 'service/main.js.*--name fx-tag')
+curl -s "$C/admin/records?ids=$RID" | jq '.records[0] | {channel:.progress.channel,
+  gaps:(.progress.gaps|length), version, status, output,
+  seg:[.progress.segments[]|{slot,actual:.actualVersion,rcpt:.entryReceipt.observed}]}'
+
+# 重启生产者并放行，缓冲证据补齐原请求：
+node dist/service/main.js --data-dir $DATA --topology $TOP --name fx-tag &
+node dist/entry/main.js   --data-dir $DATA --topology $TOP --name entry-a &
+curl -s -X POST $C/admin/progress/control -H 'content-type: application/json' -d '{"entry_receipt":false}' >/dev/null
+sleep 0.5
+curl -s "$C/admin/records?ids=$RID" | jq '.records[0].progress | {channel, summary, actualVersion}'
+```
+
+### 3.9 进度通路中断、恢复与重复/迟到上报（progress-path-outage-duplicates-late）
+
+```bash
+curl -s -X POST $C/admin/progress/control -H 'content-type: application/json' -d '{"service_done":true}' >/dev/null
+RID=$(curl -s -X POST $EC/accept -H 'content-type: application/json' \
+      -d '{"group":"currency","input":999}' | jq -r .requestId)
+sleep 0.8
+# 业务结果照常正确，但查询标出缺口：
+curl -s $EC/requests/$RID | jq '{status,version,output}'
+curl -s "$C/admin/records?ids=$RID" | jq '.records[0].progress | {channel, gaps:(.gaps|length)}'
+
+# 恢复通路：outbox 自动补投，缺口关闭：
+curl -s -X POST $C/admin/progress/control -H 'content-type: application/json' -d '{"service_done":false}' >/dev/null
+sleep 0.6
+curl -s "$C/admin/records?ids=$RID" | jq '.records[0].progress | {channel, summary}'
+
+# 重复/迟到上报：同一 (requestId,slot) 不会重复出现，也不会版本/状态倒退。
+```
+
 ---
 
 ## 4. 观察与排错
 
 - 批次与绑定：`GET /admin/state`、`GET /admin/state?detail=1`
 - 请求各段版本与结果：`GET <entry>/requests/:id`
+- 请求分段进度与证据（完成/收讫/缺口）：`GET /admin/records?ids=<id>`
 - 入口/服务实时能力：`GET /admin/entries`、`GET /admin/services`
 - 配置传输计量：`GET /admin/transport`
+- 进度通路状态：`GET /admin/progress/control`
 - 日志：每个进程打印到 stdout，带时间戳与角色前缀（如 `[entry-a]`）。
 
 常见返回码：
