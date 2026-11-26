@@ -18,7 +18,7 @@ import type {
   Topology,
   Version,
 } from '../shared/types';
-import type { ConfigRepository, CoordinatorRepository } from '../shared/store';
+import type { ConfigRepository, CoordinatorRepository, KvStore } from '../shared/store';
 import { TransportLedger } from '../shared/store';
 import { requiredServices, validateConfigDocument, walkRoute } from '../shared/engine';
 import { jsonRequest } from '../shared/http';
@@ -64,6 +64,7 @@ export class ReleaseController {
     private readonly repo: CoordinatorRepository,
     private readonly configs: ConfigRepository,
     private readonly peers = new PeerClient(),
+    private readonly transportSink?: KvStore,
   ) {
     this.state = this.repo.loadState() ?? this.blankState();
   }
@@ -370,7 +371,7 @@ export class ReleaseController {
     await Promise.all(
       targets.map(async (service) => {
         const url = `http://127.0.0.1:${service.port}`;
-        const result = await this.peers.installConfig(url, doc, meta?.digest);
+        const result = await this.peers.installConfig(url, doc, meta?.digest, 'coordinator');
         if (result.ok) installed.push(service.name);
         else failed.push({ service: service.name, error: result.error ?? 'install failed' });
       }),
@@ -678,7 +679,7 @@ export class ReleaseController {
           blocked.push({ service: name, reason: 'not present in topology' });
           return;
         }
-        const installed = await this.peers.installConfig(url, doc, meta?.digest);
+        const installed = await this.peers.installConfig(url, doc, meta?.digest, 'coordinator');
         if (!installed.ok) {
           blocked.push({ service: name, reason: installed.error ?? 'install failed' });
         }
@@ -711,7 +712,7 @@ export class ReleaseController {
           blocked.push({ service: name, reason: `unreachable: ${before.error ?? 'no response'}` });
           return;
         }
-        const installed = await this.peers.installConfig(url, doc, meta?.digest);
+        const installed = await this.peers.installConfig(url, doc, meta?.digest, 'coordinator');
         if (!installed.ok) {
           blocked.push({ service: name, reason: `install failed: ${installed.error}` });
           return;
@@ -949,22 +950,32 @@ export class ReleaseController {
   }
 
   /**
-   * Aggregate durable transport accounting from every process. Each entry and
-   * service accounts the full-config bytes that crossed into it; the sum is
-   * the cluster-wide total the invariant is stated over.
+   * Aggregate transport accounting across the whole cluster.
+   *
+   * The durable sink holds one COMPLETE snapshot per role. A restarted process
+   * overwrites its own snapshot (so a reboot never double counts), while an
+   * offline process's last snapshot stays in place — that is what keeps its
+   * historical traffic in the aggregate after it stops. Live `/admin/transport`
+   * responses overlay the freshest counters while the process is reachable.
    */
   async transportSummary(): Promise<{
     configBytes: number;
     perProcess: Record<string, number>;
     versions: Record<string, number>;
+    provisions: Record<string, Record<string, { count: number; sources: Record<string, number> }>>;
+    offline: string[];
+    durableBytes: number;
   }> {
     const perProcess: Record<string, number> = {};
-    const versions: Record<string, number> = {};
+    const offline: string[] = [];
 
     const own = new TransportLedger(this.repo.store).summary();
     perProcess.coordinator = own.configBytes;
-    for (const [version, bytes] of Object.entries(own.byVersion)) {
-      versions[version] = (versions[version] ?? 0) + bytes;
+
+    // Durable baseline: one snapshot per role, including offline processes.
+    const durable = new TransportLedger(this.repo.store, this.transportSink).durableSummary();
+    for (const [role, bytes] of Object.entries(durable.byRole)) {
+      perProcess[role] = bytes;
     }
 
     const squeezes = [
@@ -980,18 +991,31 @@ export class ReleaseController {
     await Promise.all(
       squeezes.map(async ({ name, url }) => {
         const res = await jsonRequest<{
-          transport: { configBytes: number; versionsFetched?: Record<string, number> };
+          transport: { configBytes: number };
         }>(url, { path: '/admin/transport', timeoutMs: 1000 });
-        if (!res.ok || !res.body?.transport) return;
-        perProcess[name] = res.body.transport.configBytes;
-        for (const [version, bytes] of Object.entries(res.body.transport.versionsFetched ?? {})) {
-          versions[version] = (versions[version] ?? 0) + bytes;
+        if (!res.ok || !res.body?.transport) {
+          offline.push(name);
+          return;
         }
+        // Live value is authoritative while the process runs; its durable
+        // snapshot remains the value used once it later goes offline.
+        perProcess[name] = res.body.transport.configBytes;
       }),
     );
 
+    const durableVersionBytes = Object.values(durable.byVersion).reduce(
+      (sum, value) => sum + value,
+      0,
+    );
     const configBytes = Object.values(perProcess).reduce((sum, value) => sum + value, 0);
-    return { configBytes, perProcess, versions };
+    return {
+      configBytes,
+      perProcess,
+      versions: { ...durable.byVersion },
+      provisions: durable.provisions,
+      offline: offline.sort(),
+      durableBytes: durableVersionBytes,
+    };
   }
 
   /**

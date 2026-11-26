@@ -80,6 +80,25 @@ export function loadConfig(path: string): ConfigDocument {
 export const coordinatorUrl = (topology: Topology): string =>
   `http://127.0.0.1:${topology.coordinator.port}`;
 
+/**
+ * Ordered config sources for a process: coordinator first, then every peer
+ * entry (each entry keeps a durable, verified config cache of its own). When
+ * the preferred source goes offline mid-transfer the remaining entries can
+ * still complete the missing document.
+ */
+export const configSources = (
+  topology: Topology,
+  selfEntryName?: string,
+): { name: string; baseUrl: string }[] => [
+  { name: 'coordinator', baseUrl: coordinatorUrl(topology) },
+  ...topology.entries
+    .filter((entry) => entry.name !== selfEntryName)
+    .map((entry) => ({
+      name: `entry:${entry.name}`,
+      baseUrl: `http://127.0.0.1:${entry.port}`,
+    })),
+];
+
 export const entryUrl = (topology: Topology, name: string): string => {
   const entry = topology.entries.find((candidate) => candidate.name === name);
   if (!entry) throw new Error(`unknown entry ${name}`);

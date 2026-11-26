@@ -17,9 +17,11 @@ import {
   openClusterStore,
   localStorePath,
   openStore,
+  openClusterTransportSink,
   LedgerRepository,
   LocalConfigCache,
   ProcessState,
+  TransportLedger,
   type KvStore,
 } from '../shared/store';
 import { ConfigCache } from '../shared/configCache';
@@ -27,6 +29,7 @@ import { jsonRequest, startJsonServer, type JsonServer } from '../shared/http';
 import { PeerClient } from '../shared/peer';
 import { joinValues, routePath, RuleError } from '../shared/engine';
 import {
+  configSources,
   coordinatorUrl,
   fatal,
   loadTopology,
@@ -95,19 +98,31 @@ class EntryGateway {
   /** Requests this process is currently executing (for graceful drain). */
   private running = new Map<string, RequestRecord>();
   private syncTimer?: NodeJS.Timeout;
+  private snapshotTimer?: NodeJS.Timeout;
   private syncing = false;
   private initialized = false;
+  private readonly transportLedger: TransportLedger;
 
   constructor(
     private readonly name: string,
     private readonly topology: Topology,
     private readonly cluster: KvStore,
     private readonly local: KvStore,
+    dataDir: string,
   ) {
-    this.cache = new ConfigCache(new LocalConfigCache(local, name), coordinatorUrl(topology), {
-      store: local,
-      role: `entry:${name}`,
-    });
+    // Coordinator is the preferred source; peer entries are fallbacks used
+    // when the preferred source is unreachable. ConfigCache writes the entry's
+    // local transport counters, which this process republishes as a complete
+    // durable snapshot so its traffic survives going offline.
+    this.transportLedger = new TransportLedger(local, openClusterTransportSink(dataDir));
+    this.cache = new ConfigCache(
+      new LocalConfigCache(local, name),
+      configSources(topology, name),
+      {
+        store: local,
+        role: `entry:${name}`,
+      },
+    );
     this.ledger = new LedgerRepository(cluster);
   }
 
@@ -118,7 +133,7 @@ class EntryGateway {
   ): Promise<EntryGateway> {
     const cluster = openClusterStore(dataDir);
     const local = openStore(localStorePath(dataDir, name));
-    const gateway = new EntryGateway(name, topology, cluster, local);
+    const gateway = new EntryGateway(name, topology, cluster, local, dataDir);
     await gateway.boot();
     return gateway;
   }
@@ -157,6 +172,12 @@ class EntryGateway {
     // This is what lets a stopped coordinator coexist with live traffic.
     this.syncTimer = setInterval(() => void this.sync(), 200);
     this.syncTimer.unref?.();
+    // Republish this entry's complete transport counters periodically so the
+    // cluster sink stays fresh; the same snapshot is rewritten after a
+    // restart (no accumulation) and retained if the entry goes offline.
+    this.publishTransportSnapshot();
+    this.snapshotTimer = setInterval(() => this.publishTransportSnapshot(), 500);
+    this.snapshotTimer.unref?.();
     logEvent(this.name, 'listening', {
       url: this.server.url,
       instance: this.instance,
@@ -164,6 +185,11 @@ class EntryGateway {
       groups: def.groups,
       versions: this.binding.versions,
     });
+  }
+
+  /** Publish this entry's full local counters as its durable cluster snapshot. */
+  private publishTransportSnapshot(): void {
+    this.transportLedger.publishSnapshot(`entry:${this.name}`, this.bootNo);
   }
 
   /** Durably remember committed bindings so acceptance survives restarts. */
@@ -369,7 +395,9 @@ class EntryGateway {
           const doc = this.cache.cached(version);
           if (!doc) continue;
           const meta = this.binding.digests[version];
-          const pushed = await this.peers.installConfig(url, doc, meta);
+          // Provenance lets the service attribute the back-fill to this entry,
+          // distinct from a coordinator push.
+          const pushed = await this.peers.installConfig(url, doc, meta, `entry:${this.name}`);
           if (!pushed.ok) return false;
         }
       }
@@ -652,6 +680,22 @@ class EntryGateway {
       };
     }
 
+    // Peer fallback source: serve a config document this entry has durably
+    // cached and verified. Execution services use this when their preferred
+    // source (the coordinator) is unreachable. Only cached documents are
+    // served — an entry never triggers a fresh fetch on a peer's behalf.
+    if (path.startsWith('/configs/') && method === 'GET') {
+      const version = decodeURIComponent(path.slice('/configs/'.length));
+      const doc = this.cache.cached(version);
+      if (!doc) {
+        return {
+          status: 404,
+          body: { ok: false, code: 'not_cached', error: `entry ${this.name} has no cached ${version}` },
+        };
+      }
+      return { status: 200, body: doc };
+    }
+
     if (path === '/admin/prepare' && method === 'POST') {
       const epoch = ctx.body?.epoch as number | undefined;
       const versions = ctx.body?.versions as Record<GroupId, Version> | undefined;
@@ -828,6 +872,8 @@ class EntryGateway {
 
   async close(): Promise<void> {
     if (this.syncTimer) clearInterval(this.syncTimer);
+    if (this.snapshotTimer) clearInterval(this.snapshotTimer);
+    this.publishTransportSnapshot();
     await this.server?.close();
     this.cluster.close();
     this.local.close();

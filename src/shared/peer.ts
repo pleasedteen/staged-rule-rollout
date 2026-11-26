@@ -73,10 +73,11 @@ export class PeerClient {
     url: string,
     doc: ConfigDocument,
     digest?: string,
+    source?: string,
   ): Promise<{ ok: boolean; cached?: boolean; error?: string }> {
     const res = await jsonRequest<{ ok: boolean; cached?: boolean; error?: string }>(url, {
       path: '/admin/config',
-      body: { doc, digest },
+      body: { doc, digest, source },
       timeoutMs: this.timeoutMs,
     });
     if (!res.ok || !res.body?.ok) {

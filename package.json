@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "validate": "npm run build && node dist/validate/run.js",
+    "test:config-cache": "node scripts/test-config-cache.js",
     "start:coordinator": "node dist/coordinator/main.js",
     "start:entry": "node dist/entry/main.js",
     "start:service": "node dist/service/main.js"

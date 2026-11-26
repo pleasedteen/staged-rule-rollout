@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { join, resolve } from 'node:path';
@@ -20,6 +20,7 @@ const FIXTURES = join(ROOT, 'fixtures');
 const TOPOLOGY_PATH = join(FIXTURES, 'topology.json');
 const PLAN_PATH = join(FIXTURES, 'plan.json');
 const DIST = join(ROOT, 'dist');
+const CULL_SCRIPT = join(ROOT, 'scripts', 'cull-config-cache.js');
 
 interface TopologyFile {
   coordinator: { port: number };
@@ -336,7 +337,123 @@ const waitBindings = async (groups: string[], timeoutMs = 8000): Promise<void> =
 
 const recordsEqual = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
 
-/** True if nothing is listening on the port (we can bind it). */
+/* --------------------------- cold-cache provisioning ------------------------ */
+
+interface ProvisionEntry {
+  count: number;
+  sources: Record<string, number>;
+}
+
+interface ServiceTransportView {
+  ok: boolean;
+  name: string;
+  instance: string;
+  bootNo: number;
+  transport: {
+    configBytes: number;
+    configFetches: number;
+    versionsFetched: Record<string, number>;
+    /** Durable, cross-restart provision history. */
+    provisions: Record<string, ProvisionEntry>;
+    /** Provisions delivered during the current process boot only. */
+    bootProvisions: Record<string, ProvisionEntry>;
+    provisionEvents: { version: string; source: string; at: number }[];
+    sources: Record<string, string>;
+  };
+}
+
+interface ClusterTransportView {
+  ok: boolean;
+  configBytes: number;
+  perProcess: Record<string, number>;
+  provisions: Record<string, Record<string, ProvisionEntry>>;
+  offline: string[];
+  durableBytes: number;
+}
+
+const clusterTransport = async (): Promise<ClusterTransportView> => {
+  const res = await jsonRequest<ClusterTransportView>(coordinatorBase, {
+    path: '/admin/transport',
+    timeoutMs: 5000,
+  });
+  if (!res.ok || !res.body) throw new Error(`cluster transport unavailable: ${res.error ?? res.status}`);
+  return res.body;
+};
+
+const serviceTransport = async (name: string): Promise<ServiceTransportView> => {
+  const res = await jsonRequest<ServiceTransportView>(serviceBase(name), {
+    path: '/admin/transport',
+    timeoutMs: 4000,
+  });
+  if (!res.ok || !res.body) throw new Error(`service ${name} transport unavailable: ${res.error ?? res.status}`);
+  return res.body;
+};
+
+const serviceVersions = async (name: string): Promise<string[]> => {
+  const res = await jsonRequest<{ versions: string[] }>(serviceBase(name), {
+    path: '/admin/versions',
+    timeoutMs: 3000,
+  });
+  return res.body?.versions ?? [];
+};
+
+const waitServiceVersion = async (name: string, version: string, timeoutMs = 20000): Promise<boolean> => {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await serviceVersions(name)).includes(version)) return true;
+    await sleep(50);
+  }
+  return false;
+};
+
+/** Delete only the process's durable config cache (state dir otherwise kept). */
+const cullConfigCache = (name: string): { removed: number; engine: string } => {
+  const result = spawnSync(process.execPath, [CULL_SCRIPT, RUN, name], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(`cache cull for ${name} failed: ${result.stderr || result.stdout}`);
+  }
+  return JSON.parse(result.stdout) as { removed: number; engine: string };
+};
+
+const provisionCount = (view: ServiceTransportView, version: string): number =>
+  view.transport.provisions[version]?.count ?? 0;
+
+/** Provisions delivered during the process's CURRENT boot only. */
+const bootProvisionCount = (view: ServiceTransportView, version: string): number =>
+  view.transport.bootProvisions[version]?.count ?? 0;
+
+/**
+ * Locate a request record by fanning out to every entry directly: records live
+ * with whichever entry actually executed the request, which may differ from
+ * the accepting entry under cross-entry recovery / concurrent waves. Entries
+ * are queried directly (not via the coordinator) so this also works while the
+ * coordinator is offline.
+ */
+const findRecord = async (requestId: string): Promise<RecordView | undefined> => {
+  const results = await Promise.all(
+    topology.entries.map(async (entry) => {
+      const res = await jsonRequest<{ record?: RecordView }>(entryBase(entry.name), {
+        path: `/requests/${encodeURIComponent(requestId)}`,
+        timeoutMs: 3000,
+      });
+      return res.ok ? res.body.record : undefined;
+    }),
+  );
+  return results.find((record): record is RecordView => Boolean(record));
+};
+
+const waitRecordAnywhere = async (requestId: string, timeoutMs = 25000): Promise<RecordView | undefined> => {
+  const deadline = Date.now() + timeoutMs;
+  let last: RecordView | undefined;
+  while (Date.now() < deadline) {
+    last = await findRecord(requestId);
+    if (last && (last.status === 'done' || last.status === 'failed')) return last;
+    await sleep(50);
+  }
+  return last;
+};
+
+/** True if the port is free (we can bind it). */
 const portFree = (port: number): Promise<boolean> =>
   new Promise((resolvePort) => {
     const server = createServer();
@@ -880,8 +997,221 @@ async function main(): Promise<number> {
       report.check(versions.size === 1 && versions.has('v2'), 'all bulk requests pinned v2', [...versions].join(','));
     }
 
-    /* --------------------------- 13. skew control ------------------------- */
-    report.section('13. Version-skew is surfaced, not silently mixed');
+    /* ---- 13. cold-cache provisioning: single vs first-wave concurrency --- */
+    report.section('13. Cold restart, missing config — single vs concurrent entries');
+    {
+      // Both scenarios run from the SAME cold-cache state: the target service
+      // keeps its state directory (journal, boot counter, transport ledger)
+      // but loses its durable config cache, so on boot it is genuinely missing
+      // the pinned version. The coordinator is stopped BEFORE the service
+      // boots, so the preferred source cannot serve the body; reachable peer
+      // entries must complete the document over local HTTP. The same start/stop
+      // order is used for the single request and the first multi-entry wave.
+
+      const coldRestart = async (target: string): Promise<void> => {
+        await cluster.kill(target);
+        const culled = cullConfigCache(target);
+        report.check(
+          culled.removed >= 1,
+          `cold-cache fixture: ${target} config documents removed (state dir kept)`,
+          `engine=${culled.engine} removed=${culled.removed}`,
+        );
+        await cluster.kill('coordinator');
+        await cluster.startService(target);
+        await cluster.waitHealthy(serviceBase(target));
+        const cold = await serviceVersions(target);
+        report.check(
+          !cold.includes('v2'),
+          `${target} boots without the pinned v2 (cold cache)`,
+          `installed=${cold.join(',') || 'none'}`,
+        );
+      };
+
+      const restoreCoordinator = async (): Promise<void> => {
+        await cluster.restart('coordinator');
+      };
+
+      /* ---- 13A. single request, one cold service, coordinator offline ---- */
+      const targetA = 'report-aggregate';
+      await coldRestart(targetA);
+      const beforeA = await serviceTransport(targetA);
+      const single = await submit('entry-b', 'report', 'cold-single');
+      const singleRecord = single.body.record as RecordView | undefined;
+      report.check(
+        single.status === 200 && singleRecord?.status === 'done' && singleRecord.version === 'v2',
+        '13A single queued request executes on the first-accepted pinned v2',
+        `status=${single.status} v=${singleRecord?.version} state=${singleRecord?.status}`,
+      );
+      report.check(
+        recordsEqual(singleRecord?.output, expectedReportV2('cold-single')),
+        '13A single request result matches the v2 oracle',
+        `out=${JSON.stringify(singleRecord?.output)} exp=${JSON.stringify(expectedReportV2('cold-single'))}`,
+      );
+      report.check(
+        (singleRecord?.segments ?? []).every((segment) => segment.version === 'v2'),
+        '13A every segment ran the pinned v2 after back-fill',
+        (singleRecord?.segments ?? []).map((s) => `${s.service}@${s.version}`).join(' '),
+      );
+      const afterA = await serviceTransport(targetA);
+      const provisionedA = await waitServiceVersion(targetA, 'v2');
+      report.check(
+        provisionedA && bootProvisionCount(afterA, 'v2') === 1,
+        `13A ${targetA} provisioned the missing v2 exactly once during this cold boot despite overlapping delivery`,
+        `bootProvisions=${JSON.stringify(afterA.transport.bootProvisions.v2 ?? {})} durableHistory=${JSON.stringify(afterA.transport.provisions.v2 ?? {})}`,
+      );
+      const deltaA = afterA.transport.configBytes - beforeA.transport.configBytes;
+      const sourceA = afterA.transport.sources.v2 ?? afterA.transport.provisionEvents.find((e) => e.version === 'v2')?.source;
+      report.check(
+        Boolean(sourceA) && sourceA !== 'coordinator',
+        '13A the completed body came from a reachable fallback source, not the offline coordinator',
+        `source=${sourceA ?? 'unknown'}`,
+      );
+      report.check(
+        deltaA > 0,
+        '13A cumulative bytes count the full received body',
+        `delta=${deltaA} B before=${beforeA.transport.configBytes} after=${afterA.transport.configBytes}`,
+      );
+      // A redelivery judged duplicate after the version is installed must
+      // still count as bytes. Compare this-boot deltas on both counters: the
+      // per-version and the process total must grow by the identical amount.
+      const perVersionDeltaA =
+        (afterA.transport.versionsFetched.v2 ?? 0) - (beforeA.transport.versionsFetched.v2 ?? 0);
+      report.check(
+        perVersionDeltaA === deltaA && deltaA > 0,
+        '13A every full v2 body received this boot (duplicates included) is counted in durable bytes',
+        `total delta=${deltaA} perVersion.v2 delta=${perVersionDeltaA}`,
+      );
+      await restoreCoordinator();
+
+      /* ---- 13B. first multi-entry wave on another cold service ----------- */
+      const targetB = 'search-index';
+      await coldRestart(targetB);
+      const beforeB = await serviceTransport(targetB);
+      // First wave: six concurrent requests fanned out across the entries
+      // that actually serve the search group (entry-a and entry-b per the
+      // topology; entry-c does not serve search).
+      const waveInputs = Array.from({ length: 6 }, (_, index) => `cold-wave-${index}`);
+      const servingEntries = topology.entries
+        .filter((entry) => entry.groups.includes('search'))
+        .map((entry) => entry.name);
+      const waveEntries = waveInputs.map((_, index) => servingEntries[index % servingEntries.length]);
+      const waveReceipts = await Promise.all(
+        waveInputs.map((input, index) => accept(waveEntries[index], 'search', input)),
+      );
+      report.check(
+        waveReceipts.every((receipt) => receipt.status === 200 && receipt.body?.requestId),
+        '13B every first-wave acceptance returns a receipt',
+        waveReceipts.map((receipt) => `${receipt.status}:${receipt.body?.code ?? 'ok'}`).join(' '),
+      );
+      const waveRecords = await Promise.all(
+        waveReceipts.map((receipt) => waitRecordAnywhere(receipt.body.requestId, 25000)),
+      );
+      const waveAllCorrect = waveInputs.every((input, index) => {
+        const record = waveRecords[index];
+        return record?.version === 'v2' && record.status === 'done' && recordsEqual(record.output, expectedSearchV2(input));
+      });
+      report.check(
+        waveAllCorrect,
+        '13B all six first-wave requests complete on pinned v2 via fallback provisioning',
+        waveRecords
+          .map((record, index) => `${record?.status}:${recordsEqual(record?.output, expectedSearchV2(waveInputs[index]))}`)
+          .join(' '),
+      );
+      report.check(
+        waveRecords.every((record) => (record?.segments ?? []).every((segment) => segment.version === 'v2')),
+        '13B no segment flipped away from the first-accepted version',
+        waveRecords.map((record) => (record?.segments ?? []).map((s) => s.version).join('/')).join(' '),
+      );
+      const afterB = await serviceTransport(targetB);
+      report.check(
+        (await waitServiceVersion(targetB, 'v2')) && bootProvisionCount(afterB, 'v2') === 1,
+        `13B ${targetB} still provisions v2 exactly once per cold boot under a six-way concurrent wave`,
+        `bootProvisions=${JSON.stringify(afterB.transport.bootProvisions.v2 ?? {})}`,
+      );
+      const deltaB = afterB.transport.configBytes - beforeB.transport.configBytes;
+      report.check(
+        deltaB > 0 && deltaA === deltaB,
+        '13B cumulative full-body bytes equal the single-request scenario',
+        `single delta=${deltaA} B, concurrent delta=${deltaB} B`,
+      );
+      const fetchedB = afterB.transport.configFetches - beforeB.transport.configFetches;
+      const perVersionDeltaB =
+        (afterB.transport.versionsFetched.v2 ?? 0) - (beforeB.transport.versionsFetched.v2 ?? 0);
+      report.check(
+        fetchedB >= 1 && perVersionDeltaB === deltaB,
+        '13B every received v2 body is counted in full in the durable ledger (duplicates included)',
+        `fetches=${fetchedB} perVersion.v2 delta=${perVersionDeltaB} total delta=${deltaB}`,
+      );
+      await restoreCoordinator();
+
+      /* ---- 13C. cluster summary keeps history after offline + restart ---- */
+      const preOffline = await clusterTransport();
+      const bytesOf = (role: string): number => preOffline.perProcess[role] ?? 0;
+      const historyA = bytesOf(`service:${targetA}`);
+      const historyB = bytesOf(`service:${targetB}`);
+      const entryB = bytesOf('entry:entry-b');
+      report.check(
+        historyA >= deltaA && historyB >= deltaB && entryB > 0,
+        '13C cluster summary already contains the provisioned traffic while processes live',
+        `${targetA}=${historyA} ${targetB}=${historyB} entry-b=${entryB}`,
+      );
+      // Take one entry and one service offline; the durable sink must retain
+      // their historical totals in the cluster aggregate.
+      await cluster.kill('entry-b');
+      await cluster.kill(targetA);
+      const offlineView = await clusterTransport();
+      report.check(
+        offlineView.offline.includes('entry:entry-b') && offlineView.offline.includes(`service:${targetA}`),
+        '13C the coordinator marks the stopped processes offline',
+        `offline=${offlineView.offline.join(',')}`,
+      );
+      report.check(
+        (offlineView.perProcess['entry:entry-b'] ?? 0) === entryB &&
+          (offlineView.perProcess[`service:${targetA}`] ?? 0) === historyA,
+        '13C historical traffic of offline processes is retained in the cluster total',
+        `entry-b live=${entryB} offline=${offlineView.perProcess['entry:entry-b'] ?? 0}; ${targetA} live=${historyA} offline=${offlineView.perProcess[`service:${targetA}`] ?? 0}`,
+      );
+      report.check(
+        offlineView.durableBytes > 0,
+        '13C the durable snapshot sink holds a positive historical floor after processes stop',
+        `durable=${offlineView.durableBytes}`,
+      );
+      // The retained snapshot for a role must match the last live value seen.
+      const retainedA = offlineView.perProcess[`service:${targetA}`] ?? 0;
+      report.check(
+        retainedA === historyA,
+        '13C an offline role keeps its last published snapshot byte-for-byte',
+        `lastLive=${historyA} retained=${retainedA}`,
+      );
+      // Restart the service from the SAME state directory; its history is
+      // still represented, and because the cache was re-populated and
+      // persisted, the new boot performs no provision at all.
+      await cluster.restart(targetA);
+      const restarted = await serviceTransport(targetA);
+      report.check(
+        (await serviceVersions(targetA)).includes('v2') && bootProvisionCount(restarted, 'v2') === 0,
+        `13C ${targetA} restart from the same directory keeps v2 with no new provision this boot`,
+        `bootProvisions=${bootProvisionCount(restarted, 'v2')} durableHistory=${provisionCount(restarted, 'v2')} versions=${(await serviceVersions(targetA)).join(',')}`,
+      );
+      await cluster.restart('entry-b');
+      const postView = await clusterTransport();
+      report.check(
+        !postView.offline.includes('entry:entry-b') && !postView.offline.includes(`service:${targetA}`),
+        '13C restarted processes rejoin the live aggregate',
+        `offline=${postView.offline.join(',') || 'none'}`,
+      );
+
+      // Final side-by-side summary printed for operators: provisioning count
+      // (per cold boot), cumulative bytes, execution result and assertion
+      // status are all reported above and in validation-report.json.
+      process.stdout.write(
+        `\ncold-cache summary: single delta=${deltaA}B boot-provisions(v2)=${bootProvisionCount(afterA, 'v2')} | ` +
+          `concurrent delta=${deltaB}B boot-provisions(v2)=${bootProvisionCount(afterB, 'v2')} | equal=${deltaA === deltaB}\n`,
+      );
+    }
+
+    /* --------------------------- 14. skew control ------------------------- */
+    report.section('14. Version-skew is surfaced, not silently mixed');
     {
       const wrongType = await jsonRequest<{ ok: boolean; code?: string; error?: string }>(
         serviceBase('fx-math'),
@@ -908,8 +1238,8 @@ async function main(): Promise<number> {
       );
     }
 
-    /* -------------------------- 14. final sanity -------------------------- */
-    report.section('14. Final consistency');
+    /* -------------------------- 15. final sanity -------------------------- */
+    report.section('15. Final consistency');
     {
       const final = await state(true);
       report.check(

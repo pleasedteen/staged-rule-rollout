@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import type { ConfigDocument, PlanFile } from '../shared/types';
 import {
   openClusterStore,
+  openClusterTransportSink,
   clusterStorePath,
   storeEngine,
   CoordinatorRepository,
@@ -12,6 +13,7 @@ import { startJsonServer } from '../shared/http';
 import { fatal, loadTopology, logEvent, parseArgs, readJson } from '../shared/runtime';
 import { validateConfigDocument } from '../shared/engine';
 import { ReleaseController } from './controller';
+import { PeerClient } from '../shared/peer';
 import { handleCoordinatorRequest } from './server';
 
 /**
@@ -31,9 +33,10 @@ async function main(): Promise<void> {
   const args = parseArgs();
   const topology = loadTopology(args.topology);
   const store = openClusterStore(args.dataDir);
+  const transportSink = openClusterTransportSink(args.dataDir);
   const repo = new CoordinatorRepository(store);
   const configs = new ConfigRepository(store);
-  const controller = new ReleaseController(topology, repo, configs);
+  const controller = new ReleaseController(topology, repo, configs, new PeerClient(), transportSink);
 
   const hasState = Boolean(repo.loadState());
   if (!hasState && args.plan) {

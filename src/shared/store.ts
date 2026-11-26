@@ -253,6 +253,24 @@ export function wipeStore(dataDir: string): void {
   rmSync(`${dataDir}/local`, { recursive: true, force: true });
 }
 
+/**
+ * Durable, cluster-wide transport sink.
+ *
+ * A *separate* file from `cluster.state.json` so execution services — which are
+ * forbidden from touching the shared cluster database — can still durably
+ * record the config bytes they accepted. Every process appends here via the
+ * lock-file engine, so the coordinator can reconstruct historical traffic even
+ * when the originating entry or service is currently offline, or was restarted
+ * from the same data directory.
+ */
+export function clusterTransportPath(dataDir: string): string {
+  return `${dataDir}/cluster.transport.json`;
+}
+
+export function openClusterTransportSink(dataDir: string): KvStore {
+  return new FileKvStore(clusterTransportPath(dataDir));
+}
+
 /* ------------------------------- Coordinator ------------------------------- */
 
 const STATE_KEY = 'coordinator:state';
@@ -457,6 +475,16 @@ export class ProcessState {
 
 /* ----------------------------- Transport ledger ---------------------------- */
 
+export interface RoleTransportSnapshot {
+  role: string;
+  configBytes: number;
+  configFetches: number;
+  byVersion: Record<string, number>;
+  provisions: Record<string, { count: number; sources: Record<string, number> }>;
+  bootNo: number;
+  updatedAt: number;
+}
+
 /**
  * Durable accounting of full-config bytes crossing process boundaries.
  *
@@ -464,15 +492,25 @@ export class ProcessState {
  * (process, version) — requests carry the version string, never the payload.
  * This ledger makes that invariant observable: its total must not grow when
  * request volume grows under a fixed topology, version set and lifecycle.
+ *
+ * Two durability tiers with different semantics:
+ *   - the process-local store keeps incremental, cumulative counters (single
+ *     writer, SQLite/file); they survive a restart of that one process.
+ *   - the optional cluster sink stores one COMPLETE snapshot per role. A
+ *     restarted process overwrites its own snapshot (no double counting), and
+ *     an offline process's last snapshot stays readable, so the coordinator
+ *     can reconstruct historical traffic without the process being alive.
  */
 export class TransportLedger {
-  constructor(private readonly store: KvStore) {}
+  constructor(
+    private readonly store: KvStore,
+    private readonly sink?: KvStore,
+  ) {}
 
   addConfigBytes(role: string, version: Version, bytes: number): void {
-    const key = 'transport:config-version';
-    const map = this.store.get<Record<string, number>>(key) ?? {};
+    const map = this.store.get<Record<string, number>>('transport:config-version') ?? {};
     map[version] = (map[version] ?? 0) + bytes;
-    this.store.set(key, map);
+    this.store.set('transport:config-version', map);
     const roles = this.store.get<Record<string, number>>('transport:config-role') ?? {};
     roles[role] = (roles[role] ?? 0) + bytes;
     this.store.set('transport:config-role', roles);
@@ -484,16 +522,105 @@ export class TransportLedger {
     this.store.set('transport:config-fetches', fetches);
   }
 
+  /**
+   * Record one *provisioning event*: a missing version became available to a
+   * process (first full, verified delivery). Re-deliveries of an already
+   * installed version are still counted as bytes/fetches but never as a new
+   * provision, which is how "delivered completely at most once" is observable.
+   */
+  addProvision(role: string, version: Version, source: string): void {
+    const key = 'transport:provisions';
+    const map =
+      this.store.get<Record<string, Record<string, { count: number; sources: Record<string, number> }>>>(key) ?? {};
+    const perRole = map[role] ?? {};
+    const entry = perRole[version] ?? { count: 0, sources: {} };
+    entry.count += 1;
+    entry.sources[source] = (entry.sources[source] ?? 0) + 1;
+    perRole[version] = entry;
+    map[role] = perRole;
+    this.store.set(key, map);
+  }
+
+  /** Publish this role's complete, current counters to the cluster sink. */
+  publishSnapshot(role: string, bootNo: number): void {
+    if (!this.sink) return;
+    const local = this.localSnapshot(role, bootNo);
+    this.sink.set(`snapshot:${role}`, local);
+  }
+
+  private localSnapshot(role: string, bootNo: number): RoleTransportSnapshot {
+    const byVersion = this.store.get<Record<string, number>>('transport:config-version') ?? {};
+    const fetches = this.store.get<Record<string, number>>('transport:config-fetches') ?? {};
+    const provisions =
+      this.store.get<Record<string, Record<string, { count: number; sources: Record<string, number> }>>>(
+        'transport:provisions',
+      ) ?? {};
+    const configBytes = Object.values(byVersion).reduce((sum, value) => sum + value, 0);
+    return {
+      role,
+      configBytes,
+      configFetches: fetches[role] ?? 0,
+      byVersion,
+      provisions: provisions[role] ?? {},
+      bootNo,
+      updatedAt: Date.now(),
+    };
+  }
+
   summary(): {
     configBytes: number;
     byVersion: Record<string, number>;
     byRole: Record<string, number>;
     fetches: Record<string, number>;
+    provisions: Record<string, Record<string, { count: number; sources: Record<string, number> }>>;
   } {
     const byVersion = this.store.get<Record<string, number>>('transport:config-version') ?? {};
     const byRole = this.store.get<Record<string, number>>('transport:config-role') ?? {};
     const fetches = this.store.get<Record<string, number>>('transport:config-fetches') ?? {};
+    const provisions =
+      this.store.get<Record<string, Record<string, { count: number; sources: Record<string, number> }>>>(
+        'transport:provisions',
+      ) ?? {};
     const configBytes = Object.values(byVersion).reduce((sum, value) => sum + value, 0);
-    return { configBytes, byVersion, byRole, fetches };
+    return { configBytes, byVersion, byRole, fetches, provisions };
+  }
+
+  /**
+   * Cluster-wide view assembled from one snapshot per role. Offline and
+   * restarted processes are both represented correctly: a restart overwrites
+   * that role's snapshot, while an offline role keeps its last one.
+   */
+  durableSummary(): {
+    configBytes: number;
+    byVersion: Record<string, number>;
+    byRole: Record<string, number>;
+    fetches: Record<string, number>;
+    provisions: Record<string, Record<string, { count: number; sources: Record<string, number> }>>;
+    snapshots: RoleTransportSnapshot[];
+  } {
+    const sink = this.sink ?? this.store;
+    const snapshots = sink
+      .keys('snapshot:')
+      .map((key) => sink.get<RoleTransportSnapshot>(key))
+      .filter((entry): entry is RoleTransportSnapshot => Boolean(entry));
+
+    const byVersion: Record<string, number> = {};
+    const byRole: Record<string, number> = {};
+    const fetches: Record<string, number> = {};
+    const provisions: Record<
+      string,
+      Record<string, { count: number; sources: Record<string, number> }>
+    > = {};
+    let configBytes = 0;
+    for (const snapshot of snapshots) {
+      configBytes += snapshot.configBytes;
+      byRole[snapshot.role] = snapshot.configBytes;
+      fetches[snapshot.role] = snapshot.configFetches;
+      provisions[snapshot.role] = snapshot.provisions;
+      for (const [version, bytes] of Object.entries(snapshot.byVersion)) {
+        byVersion[version] = (byVersion[version] ?? 0) + bytes;
+      }
+    }
+    return { configBytes, byVersion, byRole, fetches, provisions, snapshots };
   }
 }
